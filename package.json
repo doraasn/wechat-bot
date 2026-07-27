@@ -1,0 +1,23 @@
+{
+  "name": "wechat-bot",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "postinstall": "bun run scripts/patch-bridge-typing.ts",
+    "bot": "bun run bot-handler.ts",
+    "bridge": "bun run 'node_modules/weixin-clawbot-bridge/src/cli/index.ts' start --adapter webhook --endpoint 'http://127.0.0.1:3000/webhook' --port 3200",
+    "login": "bun run 'node_modules/weixin-clawbot-bridge/src/cli/index.ts' login",
+    "status": "bun run 'node_modules/weixin-clawbot-bridge/src/cli/index.ts' status",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "weixin-clawbot-bridge": "^1.0.2"
+  }
+}

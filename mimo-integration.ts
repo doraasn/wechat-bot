@@ -381,7 +381,13 @@ export async function askMimo(
         {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ parts: [{ type: "text", text: message }] }),
+          body: JSON.stringify({
+            model: {
+              providerID: DEFAULT_PROVIDER_ID,
+              modelID: DEFAULT_MODEL_ID,
+            },
+            parts: [{ type: "text", text: message }],
+          }),
         },
       )
       if (!response.ok) {

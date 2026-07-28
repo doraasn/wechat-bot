@@ -5,7 +5,7 @@
 ## 功能
 
 - 每个微信用户独立会话：`/data/work/<wechat-user-id>/`
-- 普通消息串行排队，不丢消息
+- 普通消息按用户串行排队，并持久化到用户工作区；进程重启后自动恢复
 - `/stop` 中断当前任务并清空队列，但保留长期会话
 - `/compact` 原样发送给 MiMoCode，用于压缩上下文
 - AI 回复末尾追加精简状态：时间、耗时、上下文占用、输入/输出 token
@@ -37,12 +37,13 @@ bun run scripts/patch-bridge-typing.ts
 
 ## 启动
 
-生产环境建议安装 `systemd/` 下的两个服务单元，确保 MiMo Server 先于机器人启动：
+生产环境建议安装 `systemd/` 下的三个服务单元。MiMo Server、Bot Handler 和 Bridge
+分别由 systemd 监督，任一进程异常退出都会独立重启：
 
 ```bash
 cp systemd/*.service /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now mimocode-server.service wechat-mimocode-bot.service
+systemctl enable --now mimocode-server.service wechat-mimocode-bot.service weixin-clawbot-bridge.service
 ```
 
 手动启动机器人前，需要保证 `mimo serve` 已监听 `127.0.0.1:4096`：

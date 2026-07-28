@@ -1,6 +1,8 @@
 import { mkdirSync } from "fs"
 
 const DEFAULT_TIMEOUT_MS = 300_000
+const ABORT_WAIT_MS = 5_000
+const STATUS_POLL_MS = 100
 const MIMO_SERVER_URL = process.env.MIMO_SERVER_URL ?? "http://127.0.0.1:4096"
 const DEFAULT_PROVIDER_ID = process.env.MIMO_PROVIDER_ID ?? "deepseek"
 const DEFAULT_MODEL_ID = process.env.MIMO_MODEL_ID ?? "deepseek-v4-flash"
@@ -83,6 +85,38 @@ async function createSession(cwd: string): Promise<string> {
   const data = await response.json() as { id?: string }
   if (!data.id) throw new Error("MiMo Server 创建会话失败：缺少 session ID")
   return data.id
+}
+
+async function isSessionBusy(sessionId: string, cwd: string): Promise<boolean> {
+  try {
+    const response = await fetch(serverUrl("/session/status", cwd))
+    if (!response.ok) return false
+    const statuses = await response.json() as Record<string, { type?: string }>
+    return statuses[sessionId]?.type === "busy"
+  } catch {
+    return false
+  }
+}
+
+async function waitForSessionIdle(sessionId: string, cwd: string): Promise<boolean> {
+  const deadline = Date.now() + ABORT_WAIT_MS
+  while (Date.now() < deadline) {
+    if (!await isSessionBusy(sessionId, cwd)) return true
+    await Bun.sleep(STATUS_POLL_MS)
+  }
+  return !await isSessionBusy(sessionId, cwd)
+}
+
+async function abortSession(sessionId: string, cwd: string): Promise<boolean> {
+  try {
+    await fetch(serverUrl(`/session/${encodeURIComponent(sessionId)}/abort`, cwd), {
+      method: "POST",
+      signal: AbortSignal.timeout(3_000),
+    })
+  } catch {
+    // 即使中止请求的连接断开，也继续通过状态接口确认会话已空闲。
+  }
+  return waitForSessionIdle(sessionId, cwd)
 }
 
 async function compactSession(
@@ -171,6 +205,17 @@ export async function askMimo(
   }
 
   const activeSessionId = resolvedSessionId
+  if (await isSessionBusy(activeSessionId, cwd)) {
+    const idle = await abortSession(activeSessionId, cwd)
+    if (!idle) {
+      return {
+        success: false,
+        text: "",
+        error: "MiMo Server 会话仍在处理中，请稍后重试",
+        sessionId: activeSessionId,
+      }
+    }
+  }
   if (message.trim() === "/compact") {
     return compactSession(activeSessionId, cwd, signal)
   }
@@ -185,6 +230,7 @@ export async function askMimo(
   let eventError: string | undefined
   let timedOut = false
   let aborted = false
+  let abortPromise: Promise<void> | undefined
   let settled = false
   let finish!: () => void
   const finished = new Promise<void>((resolve) => {
@@ -220,27 +266,20 @@ export async function askMimo(
     if (delta) reportProgress(delta)
   }
 
-  const abortServerSession = async () => {
-    try {
-      await fetch(serverUrl(`/session/${encodeURIComponent(activeSessionId)}/abort`, cwd), {
-        method: "POST",
-      })
-    } catch {
-      // 服务端连接中断时，本地 SSE 仍会被关闭。
-    }
+  const abortAndFinish = (reason: "aborted" | "timeout") => {
+    if (settled || abortPromise) return
+    if (reason === "timeout") timedOut = true
+    else aborted = true
+    abortPromise = (async () => {
+      await abortSession(activeSessionId, cwd)
+      finish()
+    })()
   }
-
-  const abortListener = () => {
-    aborted = true
-    void abortServerSession()
-    finish()
-  }
+  const abortListener = () => abortAndFinish("aborted")
   signal?.addEventListener("abort", abortListener, { once: true })
 
   const timeout = setTimeout(() => {
-    timedOut = true
-    void abortServerSession()
-    finish()
+    abortAndFinish("timeout")
   }, timeoutMs)
 
   function handleEvent(event: ServerEvent): void {
@@ -360,6 +399,7 @@ export async function askMimo(
   } finally {
     clearTimeout(timeout)
     signal?.removeEventListener("abort", abortListener)
+    if (abortPromise) await abortPromise
     eventController.abort()
   }
 

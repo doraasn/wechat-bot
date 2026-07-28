@@ -4,7 +4,7 @@
  * Each WeChat user gets an isolated session with persistent history.
  * Long-running requests push event-driven progress to the user.
  */
-import { sessions } from "./session-store"
+import { sessions, type QueuedMessage } from "./session-store"
 import { askMimo } from "./mimo-integration"
 import { Hono } from "hono"
 
@@ -15,11 +15,6 @@ const TYPING_REFRESH_MS = 20_000
 const DEFAULT_PROVIDER_ID = process.env.MIMO_PROVIDER_ID ?? "deepseek"
 const DEFAULT_MODEL_ID = process.env.MIMO_MODEL_ID ?? "deepseek-v4-flash"
 const FALLBACK_CONTEXT_LIMIT_TOKENS = parseInt(process.env.MIMO_CONTEXT_LIMIT_TOKENS ?? "1000000", 10)
-
-type QueuedMessage = {
-  text: string
-  receivedAt: number
-}
 
 type MimoModel = {
   providerID?: string
@@ -46,6 +41,10 @@ function checkRateLimit(userId: string, text: string): boolean {
 // ─── Active tasks tracking ────────────────────────────────────
 const activeTasks = new Map<string, AbortController>()
 const pendingQueues = new Map<string, QueuedMessage[]>()
+for (const userId of sessions.listUsers()) {
+  const queue = sessions.loadQueue(userId)
+  if (queue.length) pendingQueues.set(userId, queue)
+}
 
 function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms} 毫秒`
@@ -196,15 +195,16 @@ function handleCommand(userId: string, text: string): string | null {
   if (cmd === "/stop") {
     const active = activeTasks.get(userId)
     if (active) active.abort()
-    const dropped = pendingQueues.get(userId)?.length ?? 0
-    pendingQueues.delete(userId)
+    const total = pendingQueues.get(userId)?.length ?? 0
+    const dropped = Math.max(0, total - (active ? 1 : 0))
+    clearQueue(userId)
     return active ? `【提示】当前对话已中断，长期会话已保留${dropped ? `，已清空 ${dropped} 条排队消息` : ""}` : "【提示】当前没有正在处理的对话，长期会话已保留"
   }
 
   if (cmd === "/clear") {
     const active = activeTasks.get(userId)
     if (active) active.abort()
-    pendingQueues.delete(userId)
+    clearQueue(userId)
     sessions.clear(userId)
     const cfg = sessions.getConfig(userId)
     sessions.saveConfig(userId, { ...cfg, metadata: { ...cfg.metadata, mimoSessionId: undefined } })
@@ -213,7 +213,8 @@ function handleCommand(userId: string, text: string): string | null {
 
   if (cmd === "/stats") {
     const s = sessions.stats(userId)
-    const queued = pendingQueues.get(userId)?.length ?? 0
+    const total = pendingQueues.get(userId)?.length ?? 0
+    const queued = Math.max(0, total - (activeTasks.has(userId) ? 1 : 0))
     const running = activeTasks.has(userId) ? "是" : "否"
     return s
       ? [
@@ -244,38 +245,61 @@ function enqueueMessage(userId: string, text: string): number {
     queue = []
     pendingQueues.set(userId, queue)
   }
-  queue.push({ text, receivedAt: Date.now() })
+  queue.push({ id: crypto.randomUUID(), text, receivedAt: Date.now() })
+  sessions.saveQueue(userId, queue)
   return queue.length
 }
 
-function shiftMessage(userId: string): QueuedMessage | undefined {
+function peekMessage(userId: string): QueuedMessage | undefined {
+  return pendingQueues.get(userId)?.[0]
+}
+
+function completeMessage(userId: string, messageId: string): void {
   const queue = pendingQueues.get(userId)
-  if (!queue) return undefined
-  const next = queue.shift()
-  if (!queue.length) pendingQueues.delete(userId)
-  return next
+  if (!queue) return
+  const remaining = queue.filter((item) => item.id !== messageId)
+  if (remaining.length) pendingQueues.set(userId, remaining)
+  else pendingQueues.delete(userId)
+  sessions.saveQueue(userId, remaining)
+}
+
+function markMessageStarted(userId: string, messageId: string): boolean {
+  const queue = pendingQueues.get(userId)
+  const item = queue?.find((candidate) => candidate.id === messageId)
+  if (!queue || !item || item.startedAt) return false
+  item.startedAt = Date.now()
+  sessions.saveQueue(userId, queue)
+  return true
+}
+
+function clearQueue(userId: string): void {
+  pendingQueues.delete(userId)
+  sessions.saveQueue(userId, [])
 }
 
 function runNextMessage(userId: string): void {
   if (activeTasks.has(userId)) return
-  const next = shiftMessage(userId)
+  const next = peekMessage(userId)
   if (!next) return
   const config = sessions.getConfig(userId)
   const mimoSessionId = config.metadata?.mimoSessionId as string | undefined
-  processMessage(userId, next.text, mimoSessionId).catch((err) => console.log(`[process] error: ${err}`))
+  processMessage(userId, next, mimoSessionId).catch((err) => console.log(`[process] error: ${err}`))
 }
 
 // ─── Async processing ─────────────────────────────────────────
-async function processMessage(from: string, text: string, mimoSessionId: string | undefined) {
+async function processMessage(from: string, queuedMessage: QueuedMessage, mimoSessionId: string | undefined) {
   if (activeTasks.has(from)) {
     await sendWeChat(from, "【提示】上一条还在处理。发送 /stop 以中断。")
     return
   }
 
+  const text = queuedMessage.text
   const startedAt = Date.now()
   const abort = new AbortController()
   activeTasks.set(from, abort)
-  sessions.addMessage(from, "user", text)
+  if (markMessageStarted(from, queuedMessage.id)) {
+    sessions.addMessage(from, "user", text)
+  }
   let progressSendChain = Promise.resolve()
 
   const queueProgress = (delta?: string) => {
@@ -343,6 +367,7 @@ async function processMessage(from: string, text: string, mimoSessionId: string 
     clearInterval(typingInterval)
     await sendTyping(from, "stop")
     activeTasks.delete(from)
+    completeMessage(from, queuedMessage.id)
     runNextMessage(from)
   }
 }
@@ -372,7 +397,7 @@ app.post("/webhook", async (c) => {
 
   if (activeTasks.has(from)) {
     const queued = enqueueMessage(from, text)
-    return c.json({ text: `【提示】已加入队列，前面还有 ${queued} 条待处理。发送 /stop 以中断并清空队列。` })
+    return c.json({ text: `【提示】已加入队列，前面还有 ${Math.max(1, queued - 1)} 条待处理。发送 /stop 以中断并清空队列。` })
   }
 
   enqueueMessage(from, text)
@@ -396,7 +421,10 @@ app.post("/session/:userId/clear", (c) => {
 app.get("/admin/users", (c) => c.json({ total: sessions.listUsers().length, users: sessions.listUsers().map((id) => ({ id, ...sessions.stats(id) })) }))
 app.get("/admin/tasks", (c) => c.json({
   active: [...activeTasks.keys()],
-  queues: [...pendingQueues.entries()].map(([userId, items]) => ({ userId, count: items.length })),
+  queues: [...pendingQueues.entries()].map(([userId, items]) => ({
+    userId,
+    count: Math.max(0, items.length - (activeTasks.has(userId) ? 1 : 0)),
+  })),
   count: activeTasks.size,
 }))
 app.get("/health", (c) => c.json({ status: "ok", uptime: process.uptime() }))
@@ -407,3 +435,17 @@ console.log(`[bot-handler] starting on port ${PORT}`)
 
 Bun.serve({ fetch: (req) => app.fetch(req), port: PORT })
 console.log(`[bot-handler] listening at http://0.0.0.0:${PORT}`)
+
+/** Resume durable queues after Bridge has had time to restore the WeChat account. */
+void (async () => {
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    try {
+      const response = await fetch(`${BRIDGE_API}/api/account`)
+      if (response.ok) break
+    } catch {
+      // Bridge is started by its own systemd service after the Bot.
+    }
+    await Bun.sleep(1_000)
+  }
+  for (const userId of pendingQueues.keys()) runNextMessage(userId)
+})()

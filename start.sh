@@ -22,12 +22,13 @@ LOG_FILE="$BOT_DIR/.wechat-bot.log"
 BRIDGE_LOG="$BOT_DIR/.bridge.log"
 
 export BOT_PORT
+export WEIXIN_CLAWBOT_BRIDGE_STATE_DIR="${WEIXIN_CLAWBOT_BRIDGE_STATE_DIR:-$BOT_DIR/data/weixin-clawbot-bridge}"
 
 # ── Ensure work directories exist ──────────────────────────────
 mkdir -p /data/work
 
 ensure_config() {
-  local cfg_dir="${HOME}/.weixin-clawbot-bridge"
+  local cfg_dir="$WEIXIN_CLAWBOT_BRIDGE_STATE_DIR"
   mkdir -p "$cfg_dir"
   if [ ! -f "$cfg_dir/config.json" ]; then
     cat > "$cfg_dir/config.json" <<-EOF
@@ -56,6 +57,13 @@ start_services() {
   echo "╚══════════════════════════════════════════════════╝"
   echo ""
   ensure_config
+
+  if systemctl cat wechat-mimocode-bot.service &>/dev/null \
+    && systemctl cat weixin-clawbot-bridge.service &>/dev/null; then
+    systemctl start mimocode-server.service wechat-mimocode-bot.service weixin-clawbot-bridge.service
+    echo "  ✅ systemd 服务已启动"
+    return
+  fi
 
   # MiMoCode uses a persistent local server to avoid CLI cold starts.
   mimo_server_pid=$(port_pid "$MIMO_SERVER_PORT")
@@ -200,6 +208,12 @@ do_login() {
 # ── Stop ────────────────────────────────────────────────────────
 stop_services() {
   echo "  停止服务..."
+  if systemctl cat wechat-mimocode-bot.service &>/dev/null \
+    && systemctl cat weixin-clawbot-bridge.service &>/dev/null; then
+    systemctl stop weixin-clawbot-bridge.service wechat-mimocode-bot.service
+    echo "  ✅ systemd 服务已停止"
+    return
+  fi
   for item in "bridge:$BRIDGE_PORT" "bot:$BOT_PORT"; do
     name=${item%%:*}
     port=${item##*:}

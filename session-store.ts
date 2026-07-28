@@ -8,10 +8,10 @@
  *     ├── config.json     — per-user settings (extensible)
  *     └── media/          — received media files
  */
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync } from "fs"
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, renameSync } from "fs"
 import { join } from "path"
 
-const WORK_DIR = "/data/work"
+const WORK_DIR = process.env.MIMO_WORK_DIR ?? "/data/work"
 
 export interface Session {
   userId: string
@@ -33,7 +33,14 @@ export interface UserConfig {
   updatedAt: number
 }
 
-class SessionStore {
+export interface QueuedMessage {
+  id: string
+  text: string
+  receivedAt: number
+  startedAt?: number
+}
+
+export class SessionStore {
   private cache = new Map<string, Session>()
 
   constructor() {
@@ -58,6 +65,17 @@ class SessionStore {
 
   private configPath(userId: string): string {
     return join(this.userDir(userId), "config.json")
+  }
+
+  private queuePath(userId: string): string {
+    return join(this.userDir(userId), "queue.json")
+  }
+
+  /** Write JSON atomically so a power loss cannot leave a half-written state file. */
+  private writeJson(path: string, value: unknown): void {
+    const tempPath = `${path}.tmp`
+    writeFileSync(tempPath, JSON.stringify(value, null, 2))
+    renameSync(tempPath, path)
   }
 
   private sanitize(userId: string): string {
@@ -119,7 +137,7 @@ class SessionStore {
     if (!session) return
     session.updatedAt = Date.now()
     const dir = this.ensureUserDir(userId)
-    writeFileSync(join(dir, "session.json"), JSON.stringify(session, null, 2))
+    this.writeJson(join(dir, "session.json"), session)
   }
 
   addMessage(userId: string, role: "user" | "assistant", content: string): void {
@@ -176,7 +194,29 @@ class SessionStore {
   saveConfig(userId: string, cfg: UserConfig): void {
     cfg.updatedAt = Date.now()
     const dir = this.ensureUserDir(userId)
-    writeFileSync(join(dir, "config.json"), JSON.stringify(cfg, null, 2))
+    this.writeJson(join(dir, "config.json"), cfg)
+  }
+
+  /** Load the durable per-user queue. Invalid entries are ignored. */
+  loadQueue(userId: string): QueuedMessage[] {
+    try {
+      const data = JSON.parse(readFileSync(this.queuePath(userId), "utf-8"))
+      if (!Array.isArray(data)) return []
+      return data.filter((item): item is QueuedMessage =>
+        typeof item?.id === "string"
+        && typeof item?.text === "string"
+        && typeof item?.receivedAt === "number"
+        && (item?.startedAt === undefined || typeof item.startedAt === "number")
+      )
+    } catch {
+      return []
+    }
+  }
+
+  /** Persist the queue before acknowledging an inbound webhook. */
+  saveQueue(userId: string, queue: QueuedMessage[]): void {
+    const dir = this.ensureUserDir(userId)
+    this.writeJson(join(dir, "queue.json"), queue)
   }
 
   /** Get the media directory for a user */

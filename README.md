@@ -1,6 +1,6 @@
 # WeChat MiMoCode Bot
 
-把微信消息接入 MiMoCode 的轻量 Bot。机器人通过常驻 `mimo serve` 复用 MiMoCode 进程；每个微信用户使用独立目录和独立 session，支持排队、长期会话、上下文压缩、阶段性进度提示和微信“正在输入”状态。
+把微信消息接入 MiMoCode 的轻量 Bot。项目内置 iLink/ClawBot 协议客户端，直接连接微信，不依赖第三方 Bridge。机器人通过常驻 `mimo serve` 复用 MiMoCode 进程；每个微信用户使用独立目录和独立 session，支持排队、长期会话、上下文压缩、阶段性进度提示、Markdown 和微信“正在输入”状态。
 
 ## 功能
 
@@ -11,6 +11,8 @@
 - AI 回复末尾追加精简状态：时间、耗时、上下文占用、输入/输出 token
 - MiMoCode 产生阶段性文本后立即推送到微信，不使用定时进度提醒
 - 主动触发微信“正在输入”状态
+- 原样发送 Markdown，支持微信表格、标题、粗体和引用渲染
+- iLink 登录状态、同步游标和用户发送上下文持久化，重启后自动恢复
 - 通过 SSE 接收 MiMoCode 流式输出，`/stop` 会调用服务端中断接口
 
 ## 环境要求
@@ -18,7 +20,7 @@
 - Linux / ARM64 或 x64
 - Bun
 - MiMoCode CLI：`mimo`
-- 已登录 `weixin-clawbot-bridge`
+- 已通过 `bun run login` 登录微信 iLink
 - 已配置 MiMoCode provider，例如 DeepSeek key
 
 ## 安装
@@ -27,23 +29,15 @@
 bun install
 ```
 
-安装后会自动运行：
-
-```bash
-bun run scripts/patch-bridge-typing.ts
-```
-
-这个脚本会给 `weixin-clawbot-bridge` 增加 `/api/typing`，用于后台任务期间维持微信“正在输入”。
-
 ## 启动
 
-生产环境建议安装 `systemd/` 下的三个服务单元。MiMo Server、Bot Handler 和 Bridge
-分别由 systemd 监督，任一进程异常退出都会独立重启：
+生产环境安装 `systemd/` 下的两个服务单元。MiMo Server 与微信 Bot
+分别由 systemd 监督：
 
 ```bash
 cp systemd/*.service /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now mimocode-server.service wechat-mimocode-bot.service weixin-clawbot-bridge.service
+systemctl enable --now mimocode-server.service wechat-mimocode-bot.service
 ```
 
 手动启动机器人前，需要保证 `mimo serve` 已监听 `127.0.0.1:4096`：
@@ -99,9 +93,12 @@ MIMO_CONTEXT_LIMIT_TOKENS=1000000
 MIMO_SERVER_URL=http://127.0.0.1:4096
 MIMO_SERVER_PORT=4096
 BOT_PORT=3000
+WECHAT_ILINK_STATE_DIR=/data/projects/wechat-bot/data/ilink
 ```
 
 DeepSeek 系列默认按 1M 上下文显示占用量。
+
+微信账号、Token、同步游标和发送上下文保存在 `data/ilink/`，该目录不会提交到 Git。
 
 ## 不应提交到 GitHub 的内容
 

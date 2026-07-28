@@ -213,7 +213,7 @@ export class SessionStore {
     }
   }
 
-  /** Persist the queue before acknowledging an inbound webhook. */
+  /** 在确认收到 iLink 消息前持久化队列。 */
   saveQueue(userId: string, queue: QueuedMessage[]): void {
     const dir = this.ensureUserDir(userId)
     this.writeJson(join(dir, "queue.json"), queue)

@@ -1,15 +1,16 @@
 /**
- * Bot handler — webhook endpoint for weixin-clawbot-bridge.
+ * 微信 iLink 消息处理器。
  *
  * Each WeChat user gets an isolated session with persistent history.
  * Long-running requests push event-driven progress to the user.
  */
 import { sessions, type QueuedMessage } from "./session-store"
 import { askMimo } from "./mimo-integration"
+import { ILinkClient } from "./ilink-client"
 import { Hono } from "hono"
 
 const app = new Hono()
-const BRIDGE_API = "http://127.0.0.1:3200"
+const ilink = new ILinkClient()
 const PROGRESS_CHUNK_CHARS = 1_500
 const TYPING_REFRESH_MS = 20_000
 const DEFAULT_PROVIDER_ID = process.env.MIMO_PROVIDER_ID ?? "deepseek"
@@ -156,12 +157,7 @@ function formatErrorMessage(
 // ─── Bridge API: send message to WeChat user ──────────────────
 async function sendWeChat(to: string, text: string) {
   try {
-    const res = await fetch(`${BRIDGE_API}/api/send`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ to, text }),
-    })
-    if (!res.ok) console.log(`[send] HTTP ${res.status} for ${to}`)
+    await ilink.sendText(to, text)
   } catch (err) {
     console.log(`[send] failed to ${to}: ${err}`)
   }
@@ -169,12 +165,7 @@ async function sendWeChat(to: string, text: string) {
 
 async function sendTyping(to: string, status: "start" | "stop") {
   try {
-    const res = await fetch(`${BRIDGE_API}/api/typing`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ to, status }),
-    })
-    if (!res.ok) console.log(`[typing] HTTP ${res.status} for ${to} status=${status}`)
+    await ilink.sendTyping(to, status === "start")
   } catch (err) {
     console.log(`[typing] failed to ${to}: ${err}`)
   }
@@ -372,39 +363,36 @@ async function processMessage(from: string, queuedMessage: QueuedMessage, mimoSe
   }
 }
 
-// ─── Routes ───────────────────────────────────────────────────
-app.post("/webhook", async (c) => {
-  const body = await c.req.json<{ from?: string; content?: { type?: string; text?: string } }>()
-  const from = body.from
-  const content = body.content
-  if (!from || !content) return c.json({ error: "missing from/content" }, 400)
-
-  let text = ""
-  if (content.type === "text" && content.text) text = content.text
-  else if (content.type === "voice" && content.text) text = `[语音] ${content.text}`
-  else text = `[${content.type}消息]`
-
-  if (!checkRateLimit(from, text)) return c.json({ text: "⏳ 消息太快了" })
+// ─── iLink inbound ────────────────────────────────────────────
+async function handleInbound(from: string, text: string): Promise<void> {
+  if (!checkRateLimit(from, text)) {
+    await sendWeChat(from, "⏳ 消息太快了")
+    return
+  }
 
   if (isLocalNotice(text)) {
-    return c.json({ text: "【提示】已收到本地提示，不会发送给 AI。" })
+    await sendWeChat(from, "【提示】已收到本地提示，不会发送给 AI。")
+    return
   }
 
   const cmdReply = handleCommand(from, text)
   if (cmdReply !== null) {
-    return c.json({ text: cmdReply })
+    await sendWeChat(from, cmdReply)
+    return
   }
 
   if (activeTasks.has(from)) {
     const queued = enqueueMessage(from, text)
-    return c.json({ text: `【提示】已加入队列，前面还有 ${Math.max(1, queued - 1)} 条待处理。发送 /stop 以中断并清空队列。` })
+    await sendWeChat(
+      from,
+      `【提示】已加入队列，前面还有 ${Math.max(1, queued - 1)} 条待处理。发送 /stop 以中断并清空队列。`,
+    )
+    return
   }
 
   enqueueMessage(from, text)
   runNextMessage(from)
-
-  return c.json({ ok: true })
-})
+}
 
 // Session management
 app.get("/session/:userId", (c) => {
@@ -428,6 +416,7 @@ app.get("/admin/tasks", (c) => c.json({
   count: activeTasks.size,
 }))
 app.get("/health", (c) => c.json({ status: "ok", uptime: process.uptime() }))
+app.get("/ilink/status", (c) => c.json(ilink.status()))
 
 // ─── Start ────────────────────────────────────────────────────
 const PORT = parseInt(process.env.BOT_PORT ?? "3000", 10)
@@ -436,16 +425,19 @@ console.log(`[bot-handler] starting on port ${PORT}`)
 Bun.serve({ fetch: (req) => app.fetch(req), port: PORT })
 console.log(`[bot-handler] listening at http://0.0.0.0:${PORT}`)
 
-/** Resume durable queues after Bridge has had time to restore the WeChat account. */
+/** iLink 就绪后恢复持久化队列。 */
 void (async () => {
-  for (let attempt = 0; attempt < 60; attempt += 1) {
-    try {
-      const response = await fetch(`${BRIDGE_API}/api/account`)
-      if (response.ok) break
-    } catch {
-      // Bridge is started by its own systemd service after the Bot.
-    }
-    await Bun.sleep(1_000)
-  }
+  await ilink.start(async ({ from, text }) => handleInbound(from, text))
   for (const userId of pendingQueues.keys()) runNextMessage(userId)
-})()
+})().catch((error) => {
+  console.error(`[ilink] startup failed: ${error}`)
+  process.exit(1)
+})
+
+async function shutdown(): Promise<void> {
+  await ilink.stop()
+  process.exit(0)
+}
+
+process.on("SIGTERM", () => void shutdown())
+process.on("SIGINT", () => void shutdown())

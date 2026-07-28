@@ -31,10 +31,25 @@ export interface MimoProgress {
   tokens?: MimoResult["tokens"]
 }
 
+export interface MimoPermissionRequest {
+  id: string
+  sessionId: string
+  permission: string
+  patterns: string[]
+  metadata?: Record<string, unknown>
+  always?: string[]
+}
+
 type ServerEvent = {
   type?: string
   properties?: {
+    id?: string
+    requestID?: string
     sessionID?: string
+    permission?: string
+    patterns?: string[]
+    metadata?: Record<string, unknown>
+    always?: string[]
     error?: { message?: string } | string
     info?: {
       id?: string
@@ -64,6 +79,25 @@ type ServerEvent = {
         output?: number
       }
     }
+  }
+}
+
+export async function replyMimoPermission(
+  requestId: string,
+  cwd: string,
+  reply: "once" | "reject",
+): Promise<void> {
+  const response = await fetch(
+    serverUrl(`/permission/${encodeURIComponent(requestId)}/reply`, cwd),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ reply }),
+    },
+  )
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "")
+    throw new Error(`MiMo 权限回复失败：HTTP ${response.status}${detail ? ` ${detail}` : ""}`)
   }
 }
 
@@ -189,6 +223,7 @@ export async function askMimo(
   signal?: AbortSignal,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   onProgress?: (progress: MimoProgress) => void,
+  onPermission?: (request: MimoPermissionRequest) => void | Promise<void>,
 ): Promise<MimoResult> {
   mkdirSync(cwd, { recursive: true })
   if (signal?.aborted) return { success: false, text: "", error: "aborted" }
@@ -285,6 +320,22 @@ export async function askMimo(
   function handleEvent(event: ServerEvent): void {
     const properties = event.properties
     if (!properties || properties.sessionID !== activeSessionId) return
+
+    if (event.type === "permission.asked" && onPermission) {
+      const id = properties.id ?? properties.requestID
+      if (!id) return
+      void Promise.resolve(onPermission({
+        id,
+        sessionId: activeSessionId,
+        permission: properties.permission ?? "unknown",
+        patterns: properties.patterns ?? [],
+        metadata: properties.metadata,
+        always: properties.always,
+      })).catch((error) => {
+        console.log(`[mimo] permission notification failed: ${error}`)
+      })
+      return
+    }
 
     if (event.type === "message.updated" && properties.info) {
       const info = properties.info

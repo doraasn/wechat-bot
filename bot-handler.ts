@@ -76,6 +76,21 @@ function formatLocalTime(value: string | number | Date): string {
   return formatTimestamp(new Date(value))
 }
 
+function formatCompactTimestamp(date = new Date()): string {
+  const timestamp = formatTimestamp(date)
+  return `${timestamp.slice(2, 4)}/${timestamp.slice(5, 7)}/${timestamp.slice(8)}`
+}
+
+function formatCompactDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000))
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  if (hours > 0) return `${hours}h${minutes}'${seconds}''`
+  if (minutes > 0) return `${minutes}'${seconds}''`
+  return `${seconds}''`
+}
+
 function resolveModel(model?: MimoModel): Required<MimoModel> {
   return {
     providerID: model?.providerID ?? DEFAULT_PROVIDER_ID,
@@ -108,16 +123,16 @@ function compactModelName(model?: MimoModel): string {
 
 function buildReplyMeta(elapsedMs: number, tokens?: { total: number; input: number; output: number }, model?: MimoModel): string {
   const parts = [
-    formatTimestamp().slice(11),
-    formatDuration(elapsedMs),
+    formatCompactTimestamp(),
+    formatCompactDuration(elapsedMs),
   ]
   if (tokens) {
     const contextLimit = contextLimitForModel(model)
     const percent = contextLimit > 0 ? ((tokens.total / contextLimit) * 100).toFixed(1) : "0.0"
-    parts.push(`${formatTokenCount(tokens.total)} / ${formatTokenCount(contextLimit)}（${percent}%）`)
     parts.push(`I ${formatTokenCount(tokens.input)} / O ${formatTokenCount(tokens.output)}`)
+    parts.push(`${formatTokenCount(tokens.total)} / ${formatTokenCount(contextLimit)}(${percent}%)`)
   }
-  return `〔${parts.join("｜")}〕`
+  return parts.join("｜")
 }
 
 function compactPreview(text: string): string {

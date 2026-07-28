@@ -5,7 +5,10 @@
  * Long-running requests push event-driven progress to the user.
  */
 import { sessions, type QueuedMessage } from "./session-store"
-import { askMimo } from "./mimo-integration"
+import {
+  askMimo,
+  type MimoPermissionRule,
+} from "./mimo-integration"
 import { ILinkClient } from "./ilink-client"
 import { Hono } from "hono"
 
@@ -16,10 +19,61 @@ const TYPING_REFRESH_MS = 20_000
 const DEFAULT_PROVIDER_ID = process.env.MIMO_PROVIDER_ID ?? "deepseek"
 const DEFAULT_MODEL_ID = process.env.MIMO_MODEL_ID ?? "deepseek-v4-flash"
 const FALLBACK_CONTEXT_LIMIT_TOKENS = parseInt(process.env.MIMO_CONTEXT_LIMIT_TOKENS ?? "1000000", 10)
+const CONFIGURED_ADMIN_USER_ID = process.env.WECHAT_ADMIN_USER_ID?.trim()
 
 type MimoModel = {
   providerID?: string
   modelID?: string
+}
+
+function earliestUserId(): string | undefined {
+  return sessions.listUsers()
+    .map((userId) => ({
+      userId,
+      createdAt: sessions.stats(userId)?.createdAt ?? "",
+    }))
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt))[0]?.userId
+}
+
+let adminUserId = CONFIGURED_ADMIN_USER_ID || earliestUserId()
+
+function isAdminUser(userId: string): boolean {
+  if (!adminUserId) adminUserId = userId
+  return userId === adminUserId
+}
+
+/**
+ * 普通用户默认拒绝全部工具，仅允许文件工具访问自己的工作目录。
+ * Shell、Skill 和子代理保持拒绝，避免通过间接工具绕过目录白名单。
+ */
+function permissionsForUser(
+  userId: string,
+  cwd: string,
+): MimoPermissionRule[] {
+  if (isAdminUser(userId)) {
+    return [{
+      permission: "*",
+      pattern: "*",
+      action: "allow",
+    }]
+  }
+  const rules: MimoPermissionRule[] = [{
+    permission: "*",
+    pattern: "*",
+    action: "deny",
+  }]
+  for (const permission of ["read", "edit", "glob", "grep", "list", "lsp"]) {
+    rules.push(
+      { permission, pattern: cwd, action: "allow" },
+      { permission, pattern: `${cwd}/**`, action: "allow" },
+    )
+  }
+  rules.push({
+    permission: "question",
+    pattern: "*",
+    action: "allow",
+  })
+  return rules
 }
 
 // ─── Rate limiter ─────────────────────────────────────────────
@@ -319,6 +373,7 @@ async function processMessage(from: string, queuedMessage: QueuedMessage, mimoSe
 
   try {
     const cwd = sessions.userPath(from)
+    const permission = permissionsForUser(from, cwd)
     let result = await askMimo(
       mimoSessionId,
       text,
@@ -326,6 +381,7 @@ async function processMessage(from: string, queuedMessage: QueuedMessage, mimoSe
       abort.signal,
       undefined,
       (progress) => queueProgress(progress.delta),
+      permission,
     )
 
     // Retry if session expired
@@ -341,6 +397,7 @@ async function processMessage(from: string, queuedMessage: QueuedMessage, mimoSe
         abort.signal,
         undefined,
         (progress) => queueProgress(progress.delta),
+        permission,
       )
     }
 

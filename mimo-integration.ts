@@ -31,6 +31,12 @@ export interface MimoProgress {
   tokens?: MimoResult["tokens"]
 }
 
+export type MimoPermissionRule = {
+  permission: string
+  pattern: string
+  action: "allow" | "ask" | "deny"
+}
+
 type ServerEvent = {
   type?: string
   properties?: {
@@ -93,11 +99,18 @@ function serverUrl(path: string, cwd: string): URL {
   return url
 }
 
-async function createSession(cwd: string): Promise<string> {
+async function createSession(
+  cwd: string,
+  permission?: MimoPermissionRule[],
+  contextFrom?: string,
+): Promise<string> {
   const response = await fetch(serverUrl("/session", cwd), {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: "{}",
+    body: JSON.stringify({
+      ...(permission ? { permission } : {}),
+      ...(contextFrom ? { contextFrom } : {}),
+    }),
   })
   if (!response.ok) {
     throw new Error(`MiMo Server 创建会话失败：HTTP ${response.status}`)
@@ -105,6 +118,30 @@ async function createSession(cwd: string): Promise<string> {
   const data = await response.json() as { id?: string }
   if (!data.id) throw new Error("MiMo Server 创建会话失败：缺少 session ID")
   return data.id
+}
+
+function samePermissions(
+  current: MimoPermissionRule[] | undefined,
+  expected: MimoPermissionRule[],
+): boolean {
+  return JSON.stringify(current ?? []) === JSON.stringify(expected)
+}
+
+async function ensureSessionPermissions(
+  sessionId: string,
+  cwd: string,
+  permission: MimoPermissionRule[],
+): Promise<string> {
+  const response = await fetch(
+    serverUrl(`/session/${encodeURIComponent(sessionId)}`, cwd),
+  )
+  if (!response.ok) {
+    if (response.status === 404) return createSession(cwd, permission)
+    throw new Error(`MiMo Server 读取会话权限失败：HTTP ${response.status}`)
+  }
+  const session = await response.json() as { permission?: MimoPermissionRule[] }
+  if (samePermissions(session.permission, permission)) return sessionId
+  return createSession(cwd, permission, sessionId)
 }
 
 async function isSessionBusy(sessionId: string, cwd: string): Promise<boolean> {
@@ -209,13 +246,22 @@ export async function askMimo(
   signal?: AbortSignal,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   onProgress?: (progress: MimoProgress) => void,
+  permission?: MimoPermissionRule[],
 ): Promise<MimoResult> {
   mkdirSync(cwd, { recursive: true })
   if (signal?.aborted) return { success: false, text: "", error: "aborted" }
 
   let resolvedSessionId = sessionId
   try {
-    if (!resolvedSessionId) resolvedSessionId = await createSession(cwd)
+    if (!resolvedSessionId) {
+      resolvedSessionId = await createSession(cwd, permission)
+    } else if (permission) {
+      resolvedSessionId = await ensureSessionPermissions(
+        resolvedSessionId,
+        cwd,
+        permission,
+      )
+    }
   } catch (error) {
     return {
       success: false,

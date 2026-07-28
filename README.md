@@ -14,7 +14,8 @@
 - 原样发送 Markdown，支持微信表格、标题、粗体和引用渲染
 - iLink 登录状态、同步游标和用户发送上下文持久化，重启后自动恢复
 - 支持多个微信账号同时在线；再次扫码会追加账号，不再覆盖已有账号
-- MiMoCode 使用完全免授权模式，强制权限事件由客户端静默批准；删除操作通过全局 `AGENTS.md` 要求先征得用户确认
+- 首位微信用户为管理员；后续用户只能使用文件工具访问自己的 `/data/work/<用户>/` 目录
+- 管理员使用完全免授权模式；普通用户使用会话级目录白名单；删除操作通过全局 `AGENTS.md` 要求先征得用户确认
 - 通过 SSE 接收 MiMoCode 流式输出，`/stop` 会调用服务端中断接口
 
 ## 环境要求
@@ -96,6 +97,7 @@ MIMO_SERVER_URL=http://127.0.0.1:4096
 MIMO_SERVER_PORT=4096
 BOT_PORT=3000
 WECHAT_ILINK_STATE_DIR=/data/projects/wechat-bot/data/ilink
+WECHAT_ADMIN_USER_ID=首位微信用户的_iLink_ID
 ```
 
 DeepSeek 系列默认按 1M 上下文显示占用量。

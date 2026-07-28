@@ -2,7 +2,7 @@
  * Bot handler — webhook endpoint for weixin-clawbot-bridge.
  *
  * Each WeChat user gets an isolated session with persistent history.
- * Long-running requests send interim "processing" status to the user.
+ * Long-running requests push event-driven progress to the user.
  */
 import { sessions } from "./session-store"
 import { askMimo } from "./mimo-integration"
@@ -10,10 +10,7 @@ import { Hono } from "hono"
 
 const app = new Hono()
 const BRIDGE_API = "http://127.0.0.1:3200"
-const PROGRESS_DELAY_MS = 1_800_000
-const PROGRESS_INTERVAL_MS = 1_800_000
-const PROGRESS_PREVIEW_CHARS = 500
-const PROGRESS_MIN_DELTA_CHARS = 80
+const PROGRESS_CHUNK_CHARS = 1_500
 const TYPING_REFRESH_MS = 20_000
 const DEFAULT_PROVIDER_ID = process.env.MIMO_PROVIDER_ID ?? "deepseek"
 const DEFAULT_MODEL_ID = process.env.MIMO_MODEL_ID ?? "deepseek-v4-flash"
@@ -135,16 +132,14 @@ function buildReplyMeta(elapsedMs: number, tokens?: { total: number; input: numb
   return parts.join("｜")
 }
 
-function compactPreview(text: string): string {
+function splitProgress(text: string): string[] {
   const compact = text.trim()
-  if (compact.length <= PROGRESS_PREVIEW_CHARS) return compact
-  return `...${compact.slice(-PROGRESS_PREVIEW_CHARS)}`
-}
-
-function progressDelta(text: string, sentLength: number): string {
-  const compact = text.trim()
-  if (compact.length <= sentLength) return ""
-  return compact.slice(sentLength).trim()
+  if (!compact) return []
+  const chunks: string[] = []
+  for (let offset = 0; offset < compact.length; offset += PROGRESS_CHUNK_CHARS) {
+    chunks.push(compact.slice(offset, offset + PROGRESS_CHUNK_CHARS))
+  }
+  return chunks
 }
 
 function formatErrorMessage(
@@ -281,9 +276,20 @@ async function processMessage(from: string, text: string, mimoSessionId: string 
   const abort = new AbortController()
   activeTasks.set(from, abort)
   sessions.addMessage(from, "user", text)
-  let latestProgressText = ""
-  let lastProgressLength = 0
-  let progressInterval: ReturnType<typeof setInterval> | undefined
+  let progressSendChain = Promise.resolve()
+
+  const queueProgress = (delta?: string) => {
+    if (!delta) return
+    for (const chunk of splitProgress(delta)) {
+      progressSendChain = progressSendChain
+        .then(async () => {
+          if (abort.signal.aborted) return
+          await sendWeChat(from, `【进度】\n\n${chunk}`)
+        })
+        .catch((err) => console.log(`[progress] error: ${err}`))
+    }
+  }
+
   await sendTyping(from, "start")
   const typingRetryTimer = setTimeout(() => {
     if (!abort.signal.aborted) {
@@ -296,31 +302,10 @@ async function processMessage(from: string, text: string, mimoSessionId: string 
     }
   }, TYPING_REFRESH_MS)
 
-  const sendProgress = async () => {
-    if (abort.signal.aborted) return
-    const elapsed = formatDuration(Date.now() - startedAt)
-    if (latestProgressText && latestProgressText.length > lastProgressLength) {
-      const delta = progressDelta(latestProgressText, lastProgressLength)
-      lastProgressLength = latestProgressText.trim().length
-      if (delta.length >= PROGRESS_MIN_DELTA_CHARS) {
-        await sendWeChat(from, `【提示】处理中（已耗时 ${elapsed}）：\n\n${compactPreview(delta)}\n\n发送 /stop 以中断。`)
-      }
-      return
-    }
-    await sendWeChat(from, `【提示】还在处理中，已耗时 ${elapsed}。发送 /stop 以中断。`)
-  }
-
-  const progressTimer = setTimeout(() => {
-    sendProgress().catch((err) => console.log(`[progress] error: ${err}`))
-    progressInterval = setInterval(() => {
-      sendProgress().catch((err) => console.log(`[progress] error: ${err}`))
-    }, PROGRESS_INTERVAL_MS)
-  }, PROGRESS_DELAY_MS)
-
   try {
     const cwd = sessions.userPath(from)
     let result = await askMimo(mimoSessionId, text, cwd, abort.signal, undefined, (progress) => {
-      if (progress.text) latestProgressText = progress.text
+      queueProgress(progress.delta)
     })
 
     // Retry if session expired
@@ -330,12 +315,11 @@ async function processMessage(from: string, text: string, mimoSessionId: string 
       const cfg = sessions.getConfig(from)
       sessions.saveConfig(from, { ...cfg, metadata: { ...cfg.metadata, mimoSessionId: undefined } })
       result = await askMimo(undefined, text, cwd, abort.signal, undefined, (progress) => {
-        if (progress.text) latestProgressText = progress.text
+        queueProgress(progress.delta)
       })
     }
 
-    clearTimeout(progressTimer)
-    if (progressInterval) clearInterval(progressInterval)
+    await progressSendChain
     if (abort.signal.aborted) return
 
     if (result.success) {
@@ -354,8 +338,7 @@ async function processMessage(from: string, text: string, mimoSessionId: string 
       await sendWeChat(from, formatErrorMessage(result.error, elapsedMs, result.tokens, result.model))
     }
   } finally {
-    clearTimeout(progressTimer)
-    if (progressInterval) clearInterval(progressInterval)
+    await progressSendChain
     clearTimeout(typingRetryTimer)
     clearInterval(typingInterval)
     await sendTyping(from, "stop")

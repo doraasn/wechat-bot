@@ -23,6 +23,7 @@ export interface MimoResult {
 
 export interface MimoProgress {
   text: string
+  delta?: string
   sessionId?: string
   model?: MimoResult["model"]
   tokens?: MimoResult["tokens"]
@@ -51,6 +52,10 @@ type ServerEvent = {
       sessionID?: string
       type?: string
       text?: string
+      time?: {
+        start?: number
+        end?: number
+      }
       tokens?: {
         total?: number
         input?: number
@@ -173,6 +178,8 @@ export async function askMimo(
   const eventController = new AbortController()
   const assistantMessageIds = new Set<string>()
   const textParts = new Map<string, string>()
+  const pendingTextPartIds = new Set<string>()
+  const reportedTextPartIds = new Set<string>()
   let model: MimoResult["model"]
   let tokens: MimoResult["tokens"]
   let eventError: string | undefined
@@ -190,13 +197,27 @@ export async function askMimo(
   })
 
   const currentText = () => [...textParts.values()].join("\n").trim()
-  const reportProgress = () => {
+  const reportProgress = (delta?: string) => {
     onProgress?.({
       text: currentText(),
+      delta,
       sessionId: activeSessionId,
       model,
       tokens,
     })
+  }
+
+  const flushIntermediateText = () => {
+    const deltas: string[] = []
+    for (const partId of pendingTextPartIds) {
+      if (reportedTextPartIds.has(partId)) continue
+      const text = textParts.get(partId)?.trim()
+      if (text) deltas.push(text)
+      reportedTextPartIds.add(partId)
+    }
+    pendingTextPartIds.clear()
+    const delta = deltas.join("\n").trim()
+    if (delta) reportProgress(delta)
   }
 
   const abortServerSession = async () => {
@@ -242,15 +263,18 @@ export async function askMimo(
       if (!part.messageID || !assistantMessageIds.has(part.messageID)) return
       if (part.type === "text" && part.id) {
         textParts.set(part.id, part.text ?? "")
-        reportProgress()
+        if (part.time?.end !== undefined) pendingTextPartIds.add(part.id)
+        return
       }
       if (part.type === "step-finish") {
+        // step-finish 前的文本就是最终回复，由 Bot 统一发送，避免重复。
+        pendingTextPartIds.clear()
         const updatedTokens = tokenUsage(part.tokens)
-        if (updatedTokens) {
-          tokens = updatedTokens
-          reportProgress()
-        }
+        if (updatedTokens) tokens = updatedTokens
+        return
       }
+      // 文本后又出现推理、工具或新步骤，说明它是阶段性输出，立即推送。
+      flushIntermediateText()
       return
     }
 
@@ -262,7 +286,10 @@ export async function askMimo(
       return
     }
 
-    if (event.type === "session.idle") finish()
+    if (event.type === "session.idle") {
+      pendingTextPartIds.clear()
+      finish()
+    }
   }
 
   try {

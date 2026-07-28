@@ -8,12 +8,13 @@ RequiresMountsFor=/data
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-WorkingDirectory=/data/apps/wechat-bot
+WorkingDirectory=/data/projects/wechat-bot
 Environment=HOME=/root
 Environment=PATH=/root/.bun/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=MIMO_SERVER_URL=http://127.0.0.1:4096
-ExecStart=/data/apps/wechat-bot/start.sh daemon
-ExecStop=/data/apps/wechat-bot/start.sh stop
+Environment=WEIXIN_CLAWBOT_BRIDGE_STATE_DIR=/data/projects/wechat-bot/data/weixin-clawbot-bridge
+ExecStart=/data/projects/wechat-bot/start.sh daemon
+ExecStop=/data/projects/wechat-bot/start.sh stop
 TimeoutStartSec=90
 TimeoutStopSec=30
 

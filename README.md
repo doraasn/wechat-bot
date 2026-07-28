@@ -109,5 +109,5 @@ DeepSeek 系列默认按 1M 上下文显示占用量。
 - `*.log`
 - `.env*`
 - `/data/work/*` 用户会话目录
-- `/root/.local/share/mimocode/auth.json`
+- `/data/mimocode/data/auth.json`
 - 微信登录态和 MiMoCode key

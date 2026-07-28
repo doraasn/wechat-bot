@@ -8,6 +8,7 @@ RequiresMountsFor=/data
 Type=simple
 WorkingDirectory=/data/work
 Environment=HOME=/root
+Environment=MIMOCODE_HOME=/data/mimocode
 Environment=PATH=/root/.bun/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/usr/local/bin/mimo serve --hostname 127.0.0.1 --port 4096
 Restart=always

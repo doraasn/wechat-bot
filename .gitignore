@@ -19,6 +19,7 @@ report.*.json
 # runtime files
 .pid.*
 .sessions
+data
 temp
 tmp
 

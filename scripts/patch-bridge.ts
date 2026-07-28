@@ -5,19 +5,19 @@ const ROUTES_PATH = "node_modules/weixin-clawbot-bridge/src/server/routes.ts"
 
 function patchFile(path: string, patch: (source: string) => string): void {
   if (!existsSync(path)) {
-    console.log(`[patch-bridge-typing] skip missing ${path}`)
+    console.log(`[patch-bridge] skip missing ${path}`)
     return
   }
 
   const before = readFileSync(path, "utf-8")
   const after = patch(before)
   if (after === before) {
-    console.log(`[patch-bridge-typing] unchanged ${path}`)
+    console.log(`[patch-bridge] unchanged ${path}`)
     return
   }
 
   writeFileSync(path, after)
-  console.log(`[patch-bridge-typing] patched ${path}`)
+  console.log(`[patch-bridge] patched ${path}`)
 }
 
 patchFile(CHANNEL_PATH, (source) => {
@@ -42,6 +42,26 @@ patchFile(CHANNEL_PATH, (source) => {
 
 patchFile(ROUTES_PATH, (source) => {
   let next = source
+
+  // 微信客户端支持 Markdown；保留原文才能渲染表格、标题、粗体和引用。
+  if (next.includes("const plain = markdownToPlainText(body.text)")) {
+    next = next.replace(
+      "      const plain = markdownToPlainText(body.text)\n",
+      "      const markdown = body.text\n",
+    )
+    next = next.replace(
+      "      for (let i = 0; i < plain.length; i += 4000) {\n        chunks.push(plain.slice(i, i + 4000))\n",
+      "      for (let i = 0; i < markdown.length; i += 4000) {\n        chunks.push(markdown.slice(i, i + 4000))\n",
+    )
+    next = next.replace(
+      "      if (chunks.length === 0) chunks.push(plain)\n",
+      "      if (chunks.length === 0) chunks.push(markdown)\n",
+    )
+    next = next.replace(
+      "      logger.info(`[api/send] sent to=${to} len=${plain.length}`)\n",
+      "      logger.info(`[api/send] sent to=${to} len=${markdown.length}`)\n",
+    )
+  }
 
   if (!next.includes("../core/api/api.js")) {
     next = next.replace(

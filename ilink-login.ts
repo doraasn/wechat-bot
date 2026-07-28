@@ -4,7 +4,7 @@
  * 协议流程参考 weixin-clawbot-bridge（MIT License，Copyright (c) 2026
  * cooooooooooode），登录凭据仅保存到本机 data/ilink。
  */
-import { mkdirSync, writeFileSync } from "node:fs"
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import path from "node:path"
 
 const BASE_URL = "https://ilinkai.weixin.qq.com"
@@ -39,9 +39,20 @@ function saveAccount(status: StatusResponse): string {
   const accountId = status.ilink_bot_id.trim().replace(/[@.]/g, "-")
   const accountsDir = path.join(STATE_DIR, "accounts")
   mkdirSync(accountsDir, { recursive: true })
+  let accountIds: string[] = []
+  try {
+    const saved = JSON.parse(
+      readFileSync(path.join(STATE_DIR, "accounts.json"), "utf-8"),
+    ) as unknown
+    if (Array.isArray(saved)) {
+      accountIds = saved.filter((value): value is string => typeof value === "string")
+    }
+  } catch {
+    // 首次登录时账号列表尚不存在。
+  }
   writeFileSync(
     path.join(STATE_DIR, "accounts.json"),
-    JSON.stringify([accountId], null, 2),
+    JSON.stringify([...new Set([...accountIds.filter(Boolean), accountId])], null, 2),
     { encoding: "utf-8", mode: 0o600 },
   )
   writeFileSync(

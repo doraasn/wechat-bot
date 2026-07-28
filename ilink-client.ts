@@ -49,6 +49,7 @@ type AccountData = {
 }
 
 type SendContext = {
+  accountId?: string
   contextToken: string
   typingTicket: string
   updatedAt: string
@@ -66,6 +67,8 @@ export type ILinkInboundMessage = {
 export type ILinkStatus = {
   ready: boolean
   accountId?: string
+  accountIds: string[]
+  accounts: number
   users: number
   running: boolean
 }
@@ -127,10 +130,9 @@ export class ILinkClient {
   private readonly stateDir =
     process.env.WECHAT_ILINK_STATE_DIR ?? DEFAULT_STATE_DIR
   private readonly contexts = new Map<string, SendContext>()
+  private readonly accounts = new Map<string, AccountData>()
   private abortController?: AbortController
-  private monitor?: Promise<void>
-  private accountId?: string
-  private account?: AccountData
+  private readonly monitors = new Map<string, Promise<void>>()
 
   constructor() {
     const saved = readJson<PersistedContexts>(
@@ -143,23 +145,49 @@ export class ILinkClient {
   }
 
   status(): ILinkStatus {
+    const accountIds = [...this.accounts.keys()]
     return {
-      ready: Boolean(this.account?.token),
-      accountId: this.accountId,
+      ready: accountIds.length > 0,
+      accountId: accountIds[0],
+      accountIds,
+      accounts: accountIds.length,
       users: this.contexts.size,
-      running: Boolean(this.monitor),
+      running: this.monitors.size > 0,
     }
   }
 
-  private loadAccount(): void {
-    const ids = readJson<string[]>(path.join(this.stateDir, "accounts.json"), [])
-    const accountId = ids.find(Boolean)
-    if (!accountId) throw new Error(`未找到微信账号：${this.stateDir}/accounts.json`)
-    const file = path.join(this.stateDir, "accounts", `${accountId}.json`)
-    const account = readJson<AccountData>(file, {})
-    if (!account.token) throw new Error(`微信账号缺少 token：${file}`)
-    this.accountId = accountId
-    this.account = account
+  private loadAccounts(): void {
+    const ids = [...new Set(
+      readJson<string[]>(path.join(this.stateDir, "accounts.json"), [])
+        .map((id) => id.trim())
+        .filter(Boolean),
+    )]
+    this.accounts.clear()
+    for (const accountId of ids) {
+      const file = path.join(this.stateDir, "accounts", `${accountId}.json`)
+      const account = readJson<AccountData>(file, {})
+      if (!account.token) {
+        console.log(`[ilink] skipped account without token: ${accountId}`)
+        continue
+      }
+      this.accounts.set(accountId, account)
+    }
+    if (!this.accounts.size) {
+      throw new Error(`未找到可用微信账号：${this.stateDir}/accounts.json`)
+    }
+  }
+
+  private contextAccountId(userId: string, context: SendContext): string {
+    if (context.accountId && this.accounts.has(context.accountId)) {
+      return context.accountId
+    }
+    const matched = [...this.accounts.entries()]
+      .find(([, account]) => account.userId === userId)?.[0]
+    const accountId = matched ?? this.accounts.keys().next().value
+    if (!accountId) throw new Error("微信 iLink 账号尚未就绪")
+    context.accountId = accountId
+    this.persistContexts()
+    return accountId
   }
 
   private persistContexts(): void {
@@ -170,11 +198,12 @@ export class ILinkClient {
   }
 
   private async request<T>(
+    accountId: string,
     endpoint: string,
     payload: Record<string, unknown>,
     timeoutMs = API_TIMEOUT_MS,
   ): Promise<T> {
-    const account = this.account
+    const account = this.accounts.get(accountId)
     if (!account?.token) throw new Error("微信 iLink 账号尚未就绪")
     const body = JSON.stringify({
       ...payload,
@@ -204,9 +233,14 @@ export class ILinkClient {
     }
   }
 
-  private async refreshTypingTicket(userId: string, contextToken: string): Promise<string> {
+  private async refreshTypingTicket(
+    accountId: string,
+    userId: string,
+    contextToken: string,
+  ): Promise<string> {
     const current = this.contexts.get(userId)
     if (
+      current?.accountId === accountId &&
       current?.typingTicket &&
       Date.now() - Date.parse(current.updatedAt) < 24 * 60 * 60 * 1_000
     ) {
@@ -216,20 +250,29 @@ export class ILinkClient {
       const response = await this.request<{
         ret?: number
         typing_ticket?: string
-      }>("ilink/bot/getconfig", {
+      }>(accountId, "ilink/bot/getconfig", {
         ilink_user_id: userId,
         context_token: contextToken,
       }, 10_000)
       return response.ret === 0 ? response.typing_ticket ?? "" : ""
     } catch (error) {
       console.log(`[ilink] getconfig failed user=${userId}: ${error}`)
-      return current?.typingTicket ?? ""
+      return current?.accountId === accountId ? current.typingTicket : ""
     }
   }
 
-  private async rememberContext(userId: string, contextToken: string): Promise<void> {
-    const typingTicket = await this.refreshTypingTicket(userId, contextToken)
+  private async rememberContext(
+    accountId: string,
+    userId: string,
+    contextToken: string,
+  ): Promise<void> {
+    const typingTicket = await this.refreshTypingTicket(
+      accountId,
+      userId,
+      contextToken,
+    )
     this.contexts.set(userId, {
+      accountId,
       contextToken,
       typingTicket,
       updatedAt: new Date().toISOString(),
@@ -238,28 +281,34 @@ export class ILinkClient {
   }
 
   async start(handler: (message: ILinkInboundMessage) => Promise<void>): Promise<void> {
-    if (this.monitor) return
-    this.loadAccount()
+    if (this.monitors.size) return
+    this.loadAccounts()
     this.abortController = new AbortController()
-    this.monitor = this.monitorLoop(handler, this.abortController.signal)
-    console.log(`[ilink] started account=${this.accountId}`)
+    for (const accountId of this.accounts.keys()) {
+      this.monitors.set(
+        accountId,
+        this.monitorLoop(accountId, handler, this.abortController.signal),
+      )
+    }
+    console.log(`[ilink] started accounts=${[...this.accounts.keys()].join(",")}`)
   }
 
   async stop(): Promise<void> {
     this.abortController?.abort()
-    await this.monitor?.catch(() => {})
-    this.monitor = undefined
+    await Promise.allSettled(this.monitors.values())
+    this.monitors.clear()
     this.abortController = undefined
   }
 
   private async monitorLoop(
+    accountId: string,
     handler: (message: ILinkInboundMessage) => Promise<void>,
     signal: AbortSignal,
   ): Promise<void> {
     const syncFile = path.join(
       this.stateDir,
       "accounts",
-      `${this.accountId}.sync.json`,
+      `${accountId}.sync.json`,
     )
     let buffer = readJson<{ get_updates_buf?: string }>(syncFile, {}).get_updates_buf ?? ""
     let failures = 0
@@ -273,7 +322,7 @@ export class ILinkClient {
           msgs?: ILinkMessage[]
           get_updates_buf?: string
           longpolling_timeout_ms?: number
-        }>("ilink/bot/getupdates", {
+        }>(accountId, "ilink/bot/getupdates", {
           get_updates_buf: buffer,
         }, LONG_POLL_TIMEOUT_MS)
 
@@ -294,7 +343,7 @@ export class ILinkClient {
           const from = message.from_user_id
           if (!from) continue
           if (message.context_token) {
-            await this.rememberContext(from, message.context_token)
+            await this.rememberContext(accountId, from, message.context_token)
           }
           await handler({
             id: String(message.message_id ?? crypto.randomUUID()),
@@ -309,19 +358,20 @@ export class ILinkClient {
           continue
         }
         failures += 1
-        console.log(`[ilink] monitor error (${failures}): ${error}`)
+        console.log(`[ilink] monitor error account=${accountId} (${failures}): ${error}`)
         await Bun.sleep(failures >= 3 ? BACKOFF_DELAY_MS : RETRY_DELAY_MS)
         if (failures >= 3) failures = 0
       }
     }
-    console.log("[ilink] stopped")
+    console.log(`[ilink] stopped account=${accountId}`)
   }
 
   async sendText(to: string, markdown: string): Promise<void> {
     const context = this.contexts.get(to)
     if (!context?.contextToken) throw new Error(`用户 ${to} 缺少 context_token`)
+    const accountId = this.contextAccountId(to, context)
     for (const chunk of splitMarkdown(markdown)) {
-      await this.request("ilink/bot/sendmessage", {
+      await this.request(accountId, "ilink/bot/sendmessage", {
         msg: {
           from_user_id: "",
           to_user_id: to,
@@ -341,7 +391,8 @@ export class ILinkClient {
   async sendTyping(to: string, typing: boolean): Promise<void> {
     const context = this.contexts.get(to)
     if (!context?.typingTicket) return
-    await this.request("ilink/bot/sendtyping", {
+    const accountId = this.contextAccountId(to, context)
+    await this.request(accountId, "ilink/bot/sendtyping", {
       ilink_user_id: to,
       typing_ticket: context.typingTicket,
       status: typing ? TypingStatus.TYPING : TypingStatus.CANCEL,

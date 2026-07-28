@@ -4,12 +4,12 @@
 
 ## 功能
 
-- 每个微信用户独立会话：`/root/work/<wechat-user-id>/`
+- 每个微信用户独立会话：`/data/work/<wechat-user-id>/`
 - 普通消息串行排队，不丢消息
 - `/stop` 中断当前任务并清空队列，但保留长期会话
 - `/compact` 原样发送给 MiMoCode，用于压缩上下文
 - AI 回复末尾追加精简状态：时间、耗时、上下文占用、输入/输出 token
-- 长任务每 2 分钟提示一次，预览只发送新增内容
+- 长任务每 30 分钟提示一次，预览只发送新增内容
 - 主动触发微信“正在输入”状态
 
 ## 环境要求
@@ -95,6 +95,6 @@ DeepSeek 系列默认按 1M 上下文显示占用量。
 - `.pid.*`
 - `*.log`
 - `.env*`
-- `/root/work/*` 用户会话目录
+- `/data/work/*` 用户会话目录
 - `/root/.local/share/mimocode/auth.json`
 - 微信登录态和 MiMoCode key

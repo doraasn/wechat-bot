@@ -1,9 +1,9 @@
 /**
  * Per-user persistent session store.
- * Each WeChat user gets their own directory under /root/work/<userId>/.
+ * Each WeChat user gets their own directory under /data/work/<userId>/.
  *
  * Directory structure:
- *   /root/work/<userId>/
+ *   /data/work/<userId>/
  *     ├── session.json    — conversation history
  *     ├── config.json     — per-user settings (extensible)
  *     └── media/          — received media files
@@ -11,7 +11,7 @@
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync } from "fs"
 import { join } from "path"
 
-const WORK_DIR = "/root/work"
+const WORK_DIR = "/data/work"
 
 export interface Session {
   userId: string
@@ -40,7 +40,7 @@ class SessionStore {
     this.loadAll()
   }
 
-  /** Ensure user directory exists under /root/work/ */
+  /** Ensure user directory exists under /data/work/ */
   private ensureUserDir(userId: string): string {
     const dir = join(WORK_DIR, this.sanitize(userId))
     mkdirSync(dir, { recursive: true })
@@ -64,7 +64,7 @@ class SessionStore {
     return userId.replace(/[^a-zA-Z0-9_\-.@]/g, "_")
   }
 
-  /** Load all sessions from /root/work/ subdirectories */
+  /** Load all sessions from /data/work/ subdirectories */
   private loadAll(): void {
     let entries: string[] = []
     try {

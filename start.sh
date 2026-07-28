@@ -23,7 +23,7 @@ BRIDGE_LOG="$BOT_DIR/.bridge.log"
 export BOT_PORT
 
 # ── Ensure work directories exist ──────────────────────────────
-mkdir -p /root/work
+mkdir -p /data/work
 
 ensure_config() {
   local cfg_dir="${HOME}/.weixin-clawbot-bridge"

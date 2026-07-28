@@ -1,6 +1,6 @@
 # WeChat MiMoCode Bot
 
-把微信消息接入 MiMoCode 的轻量 Bot。每个微信用户使用独立目录和独立 MiMoCode session，支持排队、长期会话、上下文压缩、阶段性进度提示和微信“正在输入”状态。
+把微信消息接入 MiMoCode 的轻量 Bot。机器人通过常驻 `mimo serve` 复用 MiMoCode 进程；每个微信用户使用独立目录和独立 session，支持排队、长期会话、上下文压缩、阶段性进度提示和微信“正在输入”状态。
 
 ## 功能
 
@@ -11,6 +11,7 @@
 - AI 回复末尾追加精简状态：时间、耗时、上下文占用、输入/输出 token
 - 长任务每 30 分钟提示一次，预览只发送新增内容
 - 主动触发微信“正在输入”状态
+- 通过 SSE 接收 MiMoCode 流式输出，`/stop` 会调用服务端中断接口
 
 ## 环境要求
 
@@ -35,6 +36,16 @@ bun run scripts/patch-bridge-typing.ts
 这个脚本会给 `weixin-clawbot-bridge` 增加 `/api/typing`，用于后台任务期间维持微信“正在输入”。
 
 ## 启动
+
+生产环境建议安装 `systemd/` 下的两个服务单元，确保 MiMo Server 先于机器人启动：
+
+```bash
+cp systemd/*.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now mimocode-server.service wechat-mimocode-bot.service
+```
+
+手动启动机器人前，需要保证 `mimo serve` 已监听 `127.0.0.1:4096`：
 
 ```bash
 ./start.sh daemon
@@ -84,6 +95,8 @@ bun run scripts/patch-bridge-typing.ts
 MIMO_PROVIDER_ID=deepseek
 MIMO_MODEL_ID=deepseek-v4-flash
 MIMO_CONTEXT_LIMIT_TOKENS=1000000
+MIMO_SERVER_URL=http://127.0.0.1:4096
+MIMO_SERVER_PORT=4096
 BOT_PORT=3000
 ```
 

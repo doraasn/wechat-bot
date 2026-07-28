@@ -1,0 +1,21 @@
+[Unit]
+Description=WeChat MiMoCode Bot
+Requires=mimocode-server.service
+After=network-online.target tailscaled.service docker.service mimocode-server.service
+Wants=network-online.target
+RequiresMountsFor=/data
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/data/apps/wechat-bot
+Environment=HOME=/root
+Environment=PATH=/root/.bun/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=MIMO_SERVER_URL=http://127.0.0.1:4096
+ExecStart=/data/apps/wechat-bot/start.sh daemon
+ExecStop=/data/apps/wechat-bot/start.sh stop
+TimeoutStartSec=90
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

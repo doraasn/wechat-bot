@@ -16,6 +16,7 @@ set -e
 BOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BOT_PORT=${BOT_PORT:-3000}
 BRIDGE_PORT=${BRIDGE_PORT:-3200}
+MIMO_SERVER_PORT=${MIMO_SERVER_PORT:-4096}
 PID_FILE="$BOT_DIR/.pid"
 LOG_FILE="$BOT_DIR/.wechat-bot.log"
 BRIDGE_LOG="$BOT_DIR/.bridge.log"
@@ -56,6 +57,21 @@ start_services() {
   echo ""
   ensure_config
 
+  # MiMoCode uses a persistent local server to avoid CLI cold starts.
+  mimo_server_pid=$(port_pid "$MIMO_SERVER_PORT")
+  if [ -z "$mimo_server_pid" ] && systemctl list-unit-files mimocode-server.service &>/dev/null; then
+    systemctl start mimocode-server.service
+    for _ in $(seq 1 60); do
+      mimo_server_pid=$(port_pid "$MIMO_SERVER_PORT")
+      [ -n "$mimo_server_pid" ] && break
+      sleep 1
+    done
+  fi
+  if [ -z "$mimo_server_pid" ]; then
+    echo "  ❌ MiMo Server 未运行 :$MIMO_SERVER_PORT"
+    exit 1
+  fi
+
   # Start bot handler (port BOT_PORT)
   bot_pid=$(port_pid "$BOT_PORT")
   if [ -n "$bot_pid" ]; then
@@ -87,6 +103,7 @@ start_services() {
 
   echo ""
   echo "  ✅ 服务已启动"
+  echo "  🧠 MiMo Server: http://127.0.0.1:$MIMO_SERVER_PORT"
   echo "  📡 Bot Handler: http://127.0.0.1:$BOT_PORT"
   echo "  🔗 Bridge     : http://127.0.0.1:$BRIDGE_PORT"
   echo "  📝 日志: $LOG_FILE"
@@ -208,9 +225,14 @@ show_status() {
 
   local bot_alive=false
   local bridge_alive=false
+  local mimo_server_alive=false
+  mimo_server_pid=$(port_pid "$MIMO_SERVER_PORT")
   bot_pid=$(port_pid "$BOT_PORT")
   bridge_pid=$(port_pid "$BRIDGE_PORT")
 
+  if [ -n "$mimo_server_pid" ]; then
+    mimo_server_alive=true
+  fi
   if [ -n "$bot_pid" ]; then
     bot_alive=true
     echo "$bot_pid" > "$PID_FILE.bot"
@@ -220,6 +242,7 @@ show_status() {
     echo "$bridge_pid" > "$PID_FILE.bridge"
   fi
   echo "  🧠 MiMoCode CLI: $(mimo --version 2>/dev/null || echo '❌ 未安装')"
+  echo "  ⚡ MiMo Server : $($mimo_server_alive && echo '✅ 运行中' || echo '❌ 未运行')"
   echo "  📡 Bot Handler: $($bot_alive && echo '✅ 运行中' || echo '❌ 未运行')"
   echo "  🔗 Bridge     : $($bridge_alive && echo '✅ 运行中' || echo '❌ 未运行')"
   echo ""

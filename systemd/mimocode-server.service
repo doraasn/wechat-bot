@@ -1,0 +1,19 @@
+[Unit]
+Description=MiMoCode persistent server
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/data
+
+[Service]
+Type=simple
+WorkingDirectory=/data/work
+Environment=HOME=/root
+Environment=PATH=/root/.bun/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/bin/mimo serve --hostname 127.0.0.1 --port 4096
+Restart=always
+RestartSec=3
+TimeoutStartSec=90
+ExecStartPost=/bin/bash -c 'for i in $(seq 1 60); do curl -fsS http://127.0.0.1:4096/session >/dev/null && exit 0; sleep 1; done; exit 1'
+
+[Install]
+WantedBy=multi-user.target

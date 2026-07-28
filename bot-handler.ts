@@ -126,8 +126,7 @@ function buildReplyMeta(elapsedMs: number, tokens?: { total: number; input: numb
   if (tokens) {
     const contextLimit = contextLimitForModel(model)
     const percent = contextLimit > 0 ? ((tokens.total / contextLimit) * 100).toFixed(1) : "0.0"
-    parts.push(`I ${formatTokenCount(tokens.input)} / O ${formatTokenCount(tokens.output)}`)
-    parts.push(`${formatTokenCount(tokens.total)} / ${formatTokenCount(contextLimit)}(${percent}%)`)
+    parts.push(`${formatTokenCount(tokens.total)}/${formatTokenCount(contextLimit)}(${percent}%)`)
   }
   return parts.join("｜")
 }

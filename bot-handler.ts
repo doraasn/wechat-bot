@@ -5,11 +5,7 @@
  * Long-running requests push event-driven progress to the user.
  */
 import { sessions, type QueuedMessage } from "./session-store"
-import {
-  askMimo,
-  replyMimoPermission,
-  type MimoPermissionRequest,
-} from "./mimo-integration"
+import { askMimo } from "./mimo-integration"
 import { ILinkClient } from "./ilink-client"
 import { Hono } from "hono"
 
@@ -46,15 +42,7 @@ function checkRateLimit(userId: string, text: string): boolean {
 // ─── Active tasks tracking ────────────────────────────────────
 const activeTasks = new Map<string, AbortController>()
 const pendingQueues = new Map<string, QueuedMessage[]>()
-const APPROVAL_TIMEOUT_MS = 4 * 60_000
 
-type PendingApproval = {
-  request: MimoPermissionRequest
-  cwd: string
-  timer: ReturnType<typeof setTimeout>
-}
-
-const pendingApprovals = new Map<string, PendingApproval>()
 for (const userId of sessions.listUsers()) {
   const queue = sessions.loadQueue(userId)
   if (queue.length) pendingQueues.set(userId, queue)
@@ -189,95 +177,13 @@ const HELP = `可用命令:
 /stop    中断当前正在处理的回复，保留长期会话
 /clear   清空当前用户历史，并在下次消息开启新会话
 /stats   查看当前用户会话统计
-/compact 发送 /compact 给 MiMoCode，让它压缩当前长期会话
-/allow   批准当前高风险操作一次
-/deny    拒绝当前高风险操作`
-
-function redactApprovalDetail(value: string): string {
-  return value
-    .replace(/github_pat_[A-Za-z0-9_]+/g, "[已隐藏 Token]")
-    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer [已隐藏]")
-    .replace(/((?:token|password|secret|api[_-]?key)\s*[=:]\s*)\S+/gi, "$1[已隐藏]")
-}
-
-async function registerApproval(
-  userId: string,
-  cwd: string,
-  request: MimoPermissionRequest,
-): Promise<void> {
-  const current = pendingApprovals.get(userId)
-  if (current?.request.id === request.id) return
-  if (current) {
-    clearTimeout(current.timer)
-    await replyMimoPermission(current.request.id, current.cwd, "reject").catch(() => {})
-  }
-
-  const timer = setTimeout(() => {
-    const pending = pendingApprovals.get(userId)
-    if (pending?.request.id !== request.id) return
-    pendingApprovals.delete(userId)
-    void replyMimoPermission(request.id, cwd, "reject")
-      .catch((error) => console.log(`[approval] timeout reject failed: ${error}`))
-    activeTasks.get(userId)?.abort()
-    void sendWeChat(userId, "【提示】授权请求已超时并自动拒绝，本次任务已中断。")
-  }, APPROVAL_TIMEOUT_MS)
-  pendingApprovals.set(userId, { request, cwd, timer })
-
-  const targets = request.patterns.length
-    ? request.patterns.map(redactApprovalDetail).join("\n")
-    : "未提供目标"
-  await sendWeChat(
-    userId,
-    [
-      "【授权请求】",
-      `操作：${request.permission}`,
-      `目标：${targets.slice(0, 1200)}`,
-      "",
-      "回复 /allow 批准一次，或 /deny 拒绝。",
-      "4 分钟未回复将自动拒绝。",
-    ].join("\n"),
-  )
-}
-
-async function answerApproval(userId: string, allow: boolean): Promise<void> {
-  const pending = pendingApprovals.get(userId)
-  if (!pending) {
-    await sendWeChat(userId, "【提示】当前没有待处理的授权请求。")
-    return
-  }
-  pendingApprovals.delete(userId)
-  clearTimeout(pending.timer)
-  try {
-    await replyMimoPermission(
-      pending.request.id,
-      pending.cwd,
-      allow ? "once" : "reject",
-    )
-    if (!allow) activeTasks.get(userId)?.abort()
-    await sendWeChat(
-      userId,
-      allow ? "【提示】已批准本次操作。" : "【提示】已拒绝本次操作，本次任务已中断。",
-    )
-  } catch (error) {
-    await sendWeChat(userId, `【提示】授权回复失败：${error}`)
-  }
-}
-
-function rejectPendingApproval(userId: string): void {
-  const pending = pendingApprovals.get(userId)
-  if (!pending) return
-  pendingApprovals.delete(userId)
-  clearTimeout(pending.timer)
-  void replyMimoPermission(pending.request.id, pending.cwd, "reject")
-    .catch((error) => console.log(`[approval] reject failed: ${error}`))
-}
+/compact 发送 /compact 给 MiMoCode，让它压缩当前长期会话`
 
 function handleCommand(userId: string, text: string): string | null {
   const cmd = text.trim().toLowerCase()
   if (cmd === "/help") return HELP
 
   if (cmd === "/stop") {
-    rejectPendingApproval(userId)
     const active = activeTasks.get(userId)
     if (active) active.abort()
     const total = pendingQueues.get(userId)?.length ?? 0
@@ -287,7 +193,6 @@ function handleCommand(userId: string, text: string): string | null {
   }
 
   if (cmd === "/clear") {
-    rejectPendingApproval(userId)
     const active = activeTasks.get(userId)
     if (active) active.abort()
     clearQueue(userId)
@@ -414,8 +319,6 @@ async function processMessage(from: string, queuedMessage: QueuedMessage, mimoSe
 
   try {
     const cwd = sessions.userPath(from)
-    const onPermission = (request: MimoPermissionRequest) =>
-      registerApproval(from, cwd, request)
     let result = await askMimo(
       mimoSessionId,
       text,
@@ -423,7 +326,6 @@ async function processMessage(from: string, queuedMessage: QueuedMessage, mimoSe
       abort.signal,
       undefined,
       (progress) => queueProgress(progress.delta),
-      onPermission,
     )
 
     // Retry if session expired
@@ -439,7 +341,6 @@ async function processMessage(from: string, queuedMessage: QueuedMessage, mimoSe
         abort.signal,
         undefined,
         (progress) => queueProgress(progress.delta),
-        onPermission,
       )
     }
 
@@ -481,12 +382,6 @@ async function handleInbound(from: string, text: string): Promise<void> {
 
   if (isLocalNotice(text)) {
     await sendWeChat(from, "【提示】已收到本地提示，不会发送给 AI。")
-    return
-  }
-
-  const approvalCommand = text.trim().toLowerCase()
-  if (approvalCommand === "/allow" || approvalCommand === "/deny") {
-    await answerApproval(from, approvalCommand === "/allow")
     return
   }
 

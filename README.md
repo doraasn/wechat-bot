@@ -13,7 +13,7 @@
 - 主动触发微信“正在输入”状态
 - 原样发送 Markdown，支持微信表格、标题、粗体和引用渲染
 - iLink 登录状态、同步游标和用户发送上下文持久化，重启后自动恢复
-- 高风险 MiMoCode 操作转发到微信，使用 `/allow` 或 `/deny` 审批
+- MiMoCode 使用完全免授权模式，强制权限事件由客户端静默批准；删除操作通过全局 `AGENTS.md` 要求先征得用户确认
 - 通过 SSE 接收 MiMoCode 流式输出，`/stop` 会调用服务端中断接口
 
 ## 环境要求
@@ -79,8 +79,6 @@ systemctl enable --now mimocode-server.service wechat-mimocode-bot.service
 /clear    清空当前用户历史，并在下次消息开启新会话
 /stats    查看当前用户会话统计
 /compact  发送 /compact 给 MiMoCode，让它压缩当前长期会话
-/allow    批准当前高风险操作一次
-/deny     拒绝当前高风险操作
 ```
 
 `【提示】` 或 `[提示]` 开头的消息不会发送给 AI，也不会进入对话历史。

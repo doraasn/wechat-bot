@@ -31,25 +31,12 @@ export interface MimoProgress {
   tokens?: MimoResult["tokens"]
 }
 
-export interface MimoPermissionRequest {
-  id: string
-  sessionId: string
-  permission: string
-  patterns: string[]
-  metadata?: Record<string, unknown>
-  always?: string[]
-}
-
 type ServerEvent = {
   type?: string
   properties?: {
     id?: string
     requestID?: string
     sessionID?: string
-    permission?: string
-    patterns?: string[]
-    metadata?: Record<string, unknown>
-    always?: string[]
     error?: { message?: string } | string
     info?: {
       id?: string
@@ -82,22 +69,21 @@ type ServerEvent = {
   }
 }
 
-export async function replyMimoPermission(
-  requestId: string,
-  cwd: string,
-  reply: "once" | "reject",
-): Promise<void> {
+/**
+ * MiMo Server 会对删除等操作强制发出权限事件。微信端运行于完全免授权模式，
+ * 因此客户端收到事件后直接批准，不再建立用户授权队列。
+ */
+async function approvePermission(requestId: string, cwd: string): Promise<void> {
   const response = await fetch(
     serverUrl(`/permission/${encodeURIComponent(requestId)}/reply`, cwd),
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ reply }),
+      body: JSON.stringify({ reply: "once" }),
     },
   )
   if (!response.ok) {
-    const detail = await response.text().catch(() => "")
-    throw new Error(`MiMo 权限回复失败：HTTP ${response.status}${detail ? ` ${detail}` : ""}`)
+    throw new Error(`自动批准 MiMo 权限失败：HTTP ${response.status}`)
   }
 }
 
@@ -223,7 +209,6 @@ export async function askMimo(
   signal?: AbortSignal,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   onProgress?: (progress: MimoProgress) => void,
-  onPermission?: (request: MimoPermissionRequest) => void | Promise<void>,
 ): Promise<MimoResult> {
   mkdirSync(cwd, { recursive: true })
   if (signal?.aborted) return { success: false, text: "", error: "aborted" }
@@ -321,18 +306,11 @@ export async function askMimo(
     const properties = event.properties
     if (!properties || properties.sessionID !== activeSessionId) return
 
-    if (event.type === "permission.asked" && onPermission) {
-      const id = properties.id ?? properties.requestID
-      if (!id) return
-      void Promise.resolve(onPermission({
-        id,
-        sessionId: activeSessionId,
-        permission: properties.permission ?? "unknown",
-        patterns: properties.patterns ?? [],
-        metadata: properties.metadata,
-        always: properties.always,
-      })).catch((error) => {
-        console.log(`[mimo] permission notification failed: ${error}`)
+    if (event.type === "permission.asked") {
+      const requestId = properties.id ?? properties.requestID
+      if (!requestId) return
+      void approvePermission(requestId, cwd).catch((error) => {
+        console.log(`[mimo] permission auto-approval failed: ${error}`)
       })
       return
     }

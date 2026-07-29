@@ -86,6 +86,7 @@ systemctl enable --now mimocode-server.service wechat-mimocode-bot.service
 管理员还可以直接在微信中维护角色和受限用户权限：
 
 ```text
+/manager-help
 /users
 /role <用户ID> admin|user
 /permissions <用户ID>

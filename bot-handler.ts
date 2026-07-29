@@ -227,25 +227,33 @@ async function sendTyping(to: string, status: "start" | "stop") {
 }
 
 // ─── Commands ─────────────────────────────────────────────────
-const USER_HELP = `可用命令:
-/help    查看所有可用命令
-/stop    中断当前正在处理的回复，保留长期会话
-/clear   清空当前用户历史，并在下次消息开启新会话
-/stats   查看当前用户会话统计
-/compact 发送 /compact 给 MiMoCode，让它压缩当前长期会话`
+const USER_HELP = `## 可用命令
 
-const ADMIN_HELP = `
+- \`/help\`：查看可用命令
+- \`/stop\`：中断当前回复并清空队列
+- \`/clear\`：清空历史，下次消息开启新会话
+- \`/stats\`：查看会话统计
+- \`/compact\`：压缩当前长期会话`
 
-管理员命令:
-/users                          查看用户和角色
-/role <用户ID> admin|user       设置角色
-/permissions <用户ID>           查看权限
-/allow-tool <用户ID> <工具>      允许文件工具
-/deny-tool <用户ID> <工具>       禁用文件工具
-/allow-path <用户ID> <绝对路径>  允许访问路径
-/deny-path <用户ID> <绝对路径>   移除允许路径
+const ADMIN_HELP = `## 管理员命令
 
-可设置工具：${SAFE_USER_TOOLS.join("、")}`
+### 用户管理
+
+- \`/users\`：查看用户和角色
+- \`/role <用户ID> admin|user\`：设置角色
+- \`/permissions <用户ID>\`：查看权限
+
+### 工具权限
+
+- \`/allow-tool <用户ID> <工具>\`：允许工具
+- \`/deny-tool <用户ID> <工具>\`：禁用工具
+
+可设置：${SAFE_USER_TOOLS.map((tool) => `\`${tool}\``).join("、")}
+
+### 路径权限
+
+- \`/allow-path <用户ID> <绝对路径>\`：允许访问
+- \`/deny-path <用户ID> <绝对路径>\`：移除权限`
 
 function stopUserWork(userId: string): number {
   const active = activeTasks.get(userId)
@@ -283,7 +291,18 @@ function formatPermissions(userId: string): string {
 function handleCommand(userId: string, text: string): string | null {
   const cmd = text.trim().toLowerCase()
   access.ensureUser(userId)
-  if (cmd === "/help") return USER_HELP + (access.isAdmin(userId) ? ADMIN_HELP : "")
+  if (cmd === "/help") {
+    return USER_HELP + (
+      access.isAdmin(userId)
+        ? "\n- `/manager-help`：查看管理员命令"
+        : ""
+    )
+  }
+  if (cmd === "/manager-help") {
+    return access.isAdmin(userId)
+      ? ADMIN_HELP
+      : "【提示】只有管理员可以查看管理员命令"
+  }
 
   if (cmd === "/stop") {
     const active = activeTasks.get(userId)

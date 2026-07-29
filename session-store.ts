@@ -6,7 +6,8 @@
  *   /data/work/<userId>/
  *     ├── session.json    — conversation history
  *     ├── config.json     — per-user settings (extensible)
- *     └── media/          — received media files
+ *     └── attachments/
+ *         └── YYYY-MM-DD/ — received media files, created on demand
  */
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, renameSync } from "fs"
 import { join } from "path"
@@ -51,7 +52,6 @@ export class SessionStore {
   private ensureUserDir(userId: string): string {
     const dir = join(WORK_DIR, this.sanitize(userId))
     mkdirSync(dir, { recursive: true })
-    mkdirSync(join(dir, "media"), { recursive: true })
     return dir
   }
 
@@ -217,12 +217,6 @@ export class SessionStore {
   saveQueue(userId: string, queue: QueuedMessage[]): void {
     const dir = this.ensureUserDir(userId)
     this.writeJson(join(dir, "queue.json"), queue)
-  }
-
-  /** Get the media directory for a user */
-  mediaDir(userId: string): string {
-    const dir = this.ensureUserDir(userId)
-    return join(dir, "media")
   }
 
   /** Get the full user directory path */

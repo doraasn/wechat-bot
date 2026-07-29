@@ -13,6 +13,14 @@ import {
   writeFileSync,
 } from "node:fs"
 import path from "node:path"
+import {
+  archiveIncomingMedia,
+  createOutgoingMediaItem,
+  DEFAULT_CDN_BASE_URL,
+  DEFAULT_MEDIA_MAX_BYTES,
+  type IncomingAttachment,
+  type MediaMessageItem,
+} from "./ilink-media"
 
 const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com"
 const DEFAULT_STATE_DIR = "/data/projects/wechat-bot/data/ilink"
@@ -26,8 +34,7 @@ const MessageItemType = { TEXT: 1, IMAGE: 2, VOICE: 3, FILE: 4, VIDEO: 5 } as co
 const MessageState = { FINISH: 2 } as const
 const TypingStatus = { TYPING: 1, CANCEL: 2 } as const
 
-type MessageItem = {
-  type?: number
+type MessageItem = MediaMessageItem & {
   text_item?: { text?: string }
   voice_item?: { text?: string }
   ref_msg?: { title?: string }
@@ -45,6 +52,7 @@ type ILinkMessage = {
 type AccountData = {
   token?: string
   baseUrl?: string
+  cdnBaseUrl?: string
   userId?: string
 }
 
@@ -61,6 +69,7 @@ export type ILinkInboundMessage = {
   id: string
   from: string
   text: string
+  attachments: IncomingAttachment[]
   timestamp: number
 }
 
@@ -95,21 +104,28 @@ function randomWechatUin(): string {
 
 function messageText(items?: MessageItem[]): string {
   if (!items?.length) return ""
+  const parts: string[] = []
   for (const item of items) {
     if (item.type === MessageItemType.TEXT && item.text_item?.text) {
       const text = item.text_item.text
-      return item.ref_msg?.title ? `[引用: ${item.ref_msg.title}]\n${text}` : text
+      parts.push(item.ref_msg?.title ? `[引用: ${item.ref_msg.title}]\n${text}` : text)
     }
     if (item.type === MessageItemType.VOICE && item.voice_item?.text) {
-      return `[语音] ${item.voice_item.text}`
+      parts.push(`[语音] ${item.voice_item.text}`)
     }
   }
-  const item = items[0]
-  if (item?.type === MessageItemType.IMAGE) return "[图片消息]"
-  if (item?.type === MessageItemType.FILE) return "[文件消息]"
-  if (item?.type === MessageItemType.VIDEO) return "[视频消息]"
-  if (item?.type === MessageItemType.VOICE) return "[语音消息]"
-  return "[未知消息]"
+  return parts.join("\n")
+}
+
+function attachmentPrompt(attachments: IncomingAttachment[]): string {
+  if (!attachments.length) return ""
+  return [
+    "【收到微信附件】",
+    ...attachments.map((attachment) =>
+      `- ${attachment.type}：${attachment.name}\n  本地路径：${attachment.path}\n  类型：${attachment.mime}，大小：${attachment.size} 字节`
+    ),
+    "请直接读取上述本地文件，并结合用户要求处理。",
+  ].join("\n")
 }
 
 /** 尽量按换行边界拆分，避免在 Markdown 表格行中间截断。 */
@@ -280,14 +296,22 @@ export class ILinkClient {
     this.persistContexts()
   }
 
-  async start(handler: (message: ILinkInboundMessage) => Promise<void>): Promise<void> {
+  async start(
+    handler: (message: ILinkInboundMessage) => Promise<void>,
+    userDirectory: (userId: string) => string,
+  ): Promise<void> {
     if (this.monitors.size) return
     this.loadAccounts()
     this.abortController = new AbortController()
     for (const accountId of this.accounts.keys()) {
       this.monitors.set(
         accountId,
-        this.monitorLoop(accountId, handler, this.abortController.signal),
+        this.monitorLoop(
+          accountId,
+          handler,
+          userDirectory,
+          this.abortController.signal,
+        ),
       )
     }
     console.log(`[ilink] started accounts=${[...this.accounts.keys()].join(",")}`)
@@ -303,6 +327,7 @@ export class ILinkClient {
   private async monitorLoop(
     accountId: string,
     handler: (message: ILinkInboundMessage) => Promise<void>,
+    userDirectory: (userId: string) => string,
     signal: AbortSignal,
   ): Promise<void> {
     const syncFile = path.join(
@@ -345,11 +370,46 @@ export class ILinkClient {
           if (message.context_token) {
             await this.rememberContext(accountId, from, message.context_token)
           }
+          const messageId = String(message.message_id ?? crypto.randomUUID())
+          const timestamp = message.create_time_ms ?? Date.now()
+          const attachments: IncomingAttachment[] = []
+          const mediaErrors: string[] = []
+          for (const [itemIndex, item] of (message.item_list ?? []).entries()) {
+            try {
+              const attachment = await archiveIncomingMedia({
+                item,
+                userDirectory: userDirectory(from),
+                messageId,
+                itemIndex,
+                timestamp,
+                cdnBaseUrl: this.accounts.get(accountId)?.cdnBaseUrl
+                  ?? DEFAULT_CDN_BASE_URL,
+                maxBytes: parseInt(
+                  process.env.WECHAT_MEDIA_MAX_BYTES
+                    ?? String(DEFAULT_MEDIA_MAX_BYTES),
+                  10,
+                ),
+              })
+              if (attachment) attachments.push(attachment)
+            } catch (error) {
+              const detail = error instanceof Error ? error.message : String(error)
+              console.log(`[ilink] media receive failed user=${from}: ${detail}`)
+              mediaErrors.push(detail)
+            }
+          }
+          const text = [
+            messageText(message.item_list),
+            attachmentPrompt(attachments),
+            mediaErrors.length
+              ? `【附件接收失败】\n${mediaErrors.map((error) => `- ${error}`).join("\n")}`
+              : "",
+          ].filter(Boolean).join("\n\n")
           await handler({
-            id: String(message.message_id ?? crypto.randomUUID()),
+            id: messageId,
             from,
-            text: messageText(message.item_list),
-            timestamp: message.create_time_ms ?? Date.now(),
+            text: text || "[未知消息]",
+            attachments,
+            timestamp,
           })
         }
       } catch (error) {
@@ -386,6 +446,38 @@ export class ILinkClient {
         },
       })
     }
+  }
+
+  /** 上传并发送图片、视频或普通文件。 */
+  async sendMedia(to: string, filePath: string): Promise<void> {
+    // 允许诊断脚本只初始化发送端，不启动 getupdates 长轮询。
+    if (!this.accounts.size) this.loadAccounts()
+    const context = this.contexts.get(to)
+    if (!context?.contextToken) throw new Error(`用户 ${to} 缺少 context_token`)
+    const accountId = this.contextAccountId(to, context)
+    const account = this.accounts.get(accountId)
+    const item = await createOutgoingMediaItem({
+      filePath,
+      toUserId: to,
+      cdnBaseUrl: account?.cdnBaseUrl ?? DEFAULT_CDN_BASE_URL,
+      maxBytes: parseInt(
+        process.env.WECHAT_MEDIA_MAX_BYTES ?? String(DEFAULT_MEDIA_MAX_BYTES),
+        10,
+      ),
+      getUploadUrl: (payload) =>
+        this.request(accountId, "ilink/bot/getuploadurl", payload),
+    })
+    await this.request(accountId, "ilink/bot/sendmessage", {
+      msg: {
+        from_user_id: "",
+        to_user_id: to,
+        client_id: `wechat-mimo-${crypto.randomUUID()}`,
+        message_type: MessageType.BOT,
+        message_state: MessageState.FINISH,
+        item_list: [item],
+        context_token: context.contextToken,
+      },
+    })
   }
 
   async sendTyping(to: string, typing: boolean): Promise<void> {

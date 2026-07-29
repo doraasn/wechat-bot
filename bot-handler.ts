@@ -10,6 +10,7 @@ import {
   type MimoPermissionRule,
 } from "./mimo-integration"
 import { AccessStore, SAFE_USER_TOOLS } from "./access-store"
+import { extractOutgoingAttachments } from "./ilink-media"
 import { ILinkClient } from "./ilink-client"
 import { Hono } from "hono"
 
@@ -223,6 +224,17 @@ async function sendTyping(to: string, status: "start" | "stop") {
     await ilink.sendTyping(to, status === "start")
   } catch (err) {
     console.log(`[typing] failed to ${to}: ${err}`)
+  }
+}
+
+async function sendWeChatMedia(to: string, filePath: string): Promise<string | null> {
+  try {
+    await ilink.sendMedia(to, filePath)
+    return null
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    console.log(`[send-media] failed to=${to} file=${filePath}: ${detail}`)
+    return `${filePath}：${detail}`
   }
 }
 
@@ -552,9 +564,21 @@ async function processMessage(from: string, queuedMessage: QueuedMessage, mimoSe
         sessions.saveConfig(from, { ...cfg, metadata: { ...cfg.metadata, mimoSessionId: result.sessionId } })
       }
       if (result.tokens) console.log(`[mimo] user=${from} tokens=${result.tokens.total}`)
-      const reply = `${result.text}\n\n${buildReplyMeta(elapsedMs, result.tokens, result.model)}`
+      const outgoing = await extractOutgoingAttachments(result.text, cwd)
+      const reply = `${outgoing.text}\n\n${buildReplyMeta(elapsedMs, result.tokens, result.model)}`
       sessions.addMessage(from, "assistant", reply)
       await sendWeChat(from, reply)
+      const mediaErrors = [...outgoing.rejected]
+      for (const filePath of outgoing.files) {
+        const error = await sendWeChatMedia(from, filePath)
+        if (error) mediaErrors.push(error)
+      }
+      if (mediaErrors.length) {
+        await sendWeChat(
+          from,
+          `【提示】部分附件未能发送：\n${mediaErrors.map((error) => `- ${error}`).join("\n")}`,
+        )
+      }
     } else {
       const elapsedMs = Date.now() - startedAt
       console.log(`[mimo] FAILED user=${from} error=${result.error} elapsed=${elapsedMs}ms`)
@@ -635,7 +659,10 @@ console.log(`[bot-handler] listening at http://0.0.0.0:${PORT}`)
 
 /** iLink 就绪后恢复持久化队列。 */
 void (async () => {
-  await ilink.start(async ({ from, text }) => handleInbound(from, text))
+  await ilink.start(
+    async ({ from, text }) => handleInbound(from, text),
+    (userId) => sessions.userPath(userId),
+  )
   for (const userId of pendingQueues.keys()) runNextMessage(userId)
 })().catch((error) => {
   console.error(`[ilink] startup failed: ${error}`)

@@ -12,6 +12,8 @@
 - MiMoCode 产生阶段性文本后立即推送到微信，不使用定时进度提醒
 - 主动触发微信“正在输入”状态
 - 原样发送 Markdown，支持微信表格、标题、粗体和引用渲染
+- 接收图片、视频、语音和普通文件，按用户与日期归档到 `attachments/YYYY-MM-DD/`
+- AI 可用 `[发送文件](相对路径)` 标记把工作目录中的图片、表格或其他文件作为微信附件发回
 - iLink 登录状态、同步游标和用户发送上下文持久化，重启后自动恢复
 - 支持多个微信账号同时在线；再次扫码会追加账号，不再覆盖已有账号
 - 首位微信用户为管理员；后续用户只能使用文件工具访问自己的 `/data/work/<用户>/` 目录
@@ -114,11 +116,31 @@ BOT_PORT=3000
 WECHAT_ILINK_STATE_DIR=/data/projects/wechat-bot/data/ilink
 WECHAT_ADMIN_USER_ID=首位微信用户的_iLink_ID
 WECHAT_ACCESS_FILE=/data/projects/wechat-bot/data/access.json
+WECHAT_MEDIA_MAX_BYTES=104857600
 ```
 
 DeepSeek 系列默认按 1M 上下文显示占用量。
 
 微信账号、Token、同步游标和发送上下文保存在 `data/ilink/`，该目录不会提交到 Git。
+
+## 附件
+
+微信收到的附件会保存到：
+
+```text
+/data/work/<微信用户ID>/attachments/YYYY-MM-DD/
+```
+
+归档文件名包含接收时间、消息 ID 和原文件名，重名时自动增加序号。默认单个附件最大 100MB。
+MiMoCode 会收到附件的绝对路径，可以直接读取图片、Excel、PDF 等文件。
+
+如果 MiMoCode 需要把生成结果作为微信附件发回，最终回复中使用：
+
+```markdown
+[发送文件](outputs/result.xlsx)
+```
+
+路径可使用相对于当前用户工作目录的路径或绝对路径，但真实文件（包括符号链接目标）必须位于该用户工作目录内。
 
 ## 不应提交到 GitHub 的内容
 

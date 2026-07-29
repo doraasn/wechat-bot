@@ -76,7 +76,7 @@ systemctl enable --now mimocode-server.service wechat-mimocode-bot.service
 ## 微信命令
 
 ```text
-/help     查看所有可用命令
+/h        查看所有可用命令
 /stop     中断当前正在处理的回复，保留长期会话
 /clear    清空当前用户历史，并在下次消息开启新会话
 /stats    查看当前用户会话统计
@@ -86,7 +86,7 @@ systemctl enable --now mimocode-server.service wechat-mimocode-bot.service
 管理员还可以直接在微信中维护角色和受限用户权限：
 
 ```text
-/manager-help
+/admin-h
 /users
 /role <用户ID> admin|user
 /permissions <用户ID>

@@ -9,6 +9,7 @@ import {
   askMimo,
   type MimoPermissionRule,
 } from "./mimo-integration"
+import { AccessStore, SAFE_USER_TOOLS } from "./access-store"
 import { ILinkClient } from "./ilink-client"
 import { Hono } from "hono"
 
@@ -26,21 +27,17 @@ type MimoModel = {
   modelID?: string
 }
 
-function earliestUserId(): string | undefined {
+function usersByCreationTime(): string[] {
   return sessions.listUsers()
     .map((userId) => ({
       userId,
       createdAt: sessions.stats(userId)?.createdAt ?? "",
     }))
-    .sort((left, right) => left.createdAt.localeCompare(right.createdAt))[0]?.userId
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+    .map((item) => item.userId)
 }
 
-let adminUserId = CONFIGURED_ADMIN_USER_ID || earliestUserId()
-
-function isAdminUser(userId: string): boolean {
-  if (!adminUserId) adminUserId = userId
-  return userId === adminUserId
-}
+const access = new AccessStore(usersByCreationTime(), CONFIGURED_ADMIN_USER_ID)
 
 /**
  * 普通用户默认拒绝全部工具，仅允许文件工具访问自己的工作目录。
@@ -50,7 +47,8 @@ function permissionsForUser(
   userId: string,
   cwd: string,
 ): MimoPermissionRule[] {
-  if (isAdminUser(userId)) {
+  const userAccess = access.get(userId)
+  if (userAccess.role === "admin") {
     return [{
       permission: "*",
       pattern: "*",
@@ -62,11 +60,14 @@ function permissionsForUser(
     pattern: "*",
     action: "deny",
   }]
-  for (const permission of ["read", "edit", "glob", "grep", "list", "lsp"]) {
-    rules.push(
-      { permission, pattern: cwd, action: "allow" },
-      { permission, pattern: `${cwd}/**`, action: "allow" },
-    )
+  const paths = [...new Set([cwd, ...userAccess.paths])]
+  for (const permission of userAccess.tools) {
+    for (const path of paths) {
+      rules.push(
+        { permission, pattern: path, action: "allow" },
+        { permission, pattern: `${path}/**`, action: "allow" },
+      )
+    }
   }
   rules.push({
     permission: "question",
@@ -226,16 +227,63 @@ async function sendTyping(to: string, status: "start" | "stop") {
 }
 
 // ─── Commands ─────────────────────────────────────────────────
-const HELP = `可用命令:
+const USER_HELP = `可用命令:
 /help    查看所有可用命令
 /stop    中断当前正在处理的回复，保留长期会话
 /clear   清空当前用户历史，并在下次消息开启新会话
 /stats   查看当前用户会话统计
 /compact 发送 /compact 给 MiMoCode，让它压缩当前长期会话`
 
+const ADMIN_HELP = `
+
+管理员命令:
+/users                          查看用户和角色
+/role <用户ID> admin|user       设置角色
+/permissions <用户ID>           查看权限
+/allow-tool <用户ID> <工具>      允许文件工具
+/deny-tool <用户ID> <工具>       禁用文件工具
+/allow-path <用户ID> <绝对路径>  允许访问路径
+/deny-path <用户ID> <绝对路径>   移除允许路径
+
+可设置工具：${SAFE_USER_TOOLS.join("、")}`
+
+function stopUserWork(userId: string): number {
+  const active = activeTasks.get(userId)
+  if (active) active.abort()
+  const total = pendingQueues.get(userId)?.length ?? 0
+  const dropped = Math.max(0, total - (active ? 1 : 0))
+  clearQueue(userId)
+  return dropped
+}
+
+function knownUser(userId: string): boolean {
+  return access.list().some((item) => item.userId === userId)
+}
+
+function formatPermissions(userId: string): string {
+  const userAccess = access.get(userId)
+  if (userAccess.role === "admin") {
+    return [
+      "【提示】用户权限",
+      `- 用户：${userId}`,
+      "- 角色：管理员",
+      "- 权限：全部",
+    ].join("\n")
+  }
+  return [
+    "【提示】用户权限",
+    `- 用户：${userId}`,
+    "- 角色：普通用户",
+    `- 工具：${userAccess.tools.length ? userAccess.tools.join("、") : "无"}`,
+    `- 固定路径：${sessions.userPath(userId)}`,
+    `- 附加路径：${userAccess.paths.length ? userAccess.paths.join("、") : "无"}`,
+  ].join("\n")
+}
+
 function handleCommand(userId: string, text: string): string | null {
   const cmd = text.trim().toLowerCase()
-  if (cmd === "/help") return HELP
+  access.ensureUser(userId)
+  if (cmd === "/help") return USER_HELP + (access.isAdmin(userId) ? ADMIN_HELP : "")
 
   if (cmd === "/stop") {
     const active = activeTasks.get(userId)
@@ -275,6 +323,80 @@ function handleCommand(userId: string, text: string): string | null {
           `- 排队：${queued}`,
           `- 处理中：${running}`,
         ].join("\n")
+  }
+
+  if (cmd === "/users") {
+    if (!access.isAdmin(userId)) return "【提示】只有管理员可以查看用户列表"
+    return [
+      "【提示】用户列表",
+      ...access.list().map((item, index) =>
+        `${index + 1}. ${item.access.role === "admin" ? "管理员" : "普通用户"}\n   ${item.userId}`
+      ),
+    ].join("\n")
+  }
+
+  const permissionsMatch = text.trim().match(/^\/permissions(?:\s+(\S+))?$/i)
+  if (permissionsMatch) {
+    const target = permissionsMatch[1] ?? userId
+    if (target !== userId && !access.isAdmin(userId)) {
+      return "【提示】只有管理员可以查看其他用户的权限"
+    }
+    if (!knownUser(target)) return "【提示】用户不存在，请先发送 /users 查看用户ID"
+    return formatPermissions(target)
+  }
+
+  const roleMatch = text.trim().match(/^\/role\s+(\S+)\s+(admin|user)$/i)
+  if (roleMatch) {
+    if (!access.isAdmin(userId)) return "【提示】只有管理员可以设置角色"
+    const target = roleMatch[1]
+    const roleValue = roleMatch[2]
+    if (!target || !roleValue) return "【提示】命令格式不正确，发送 /help 查看用法"
+    if (!knownUser(target)) return "【提示】用户不存在，请先发送 /users 查看用户ID"
+    const role = roleValue.toLowerCase() as "admin" | "user"
+    const changed = access.setRole(target, role)
+    if (!changed.ok) return `【提示】设置失败：${changed.error}`
+    const dropped = stopUserWork(target)
+    return `【提示】已将 ${target} 设置为${role === "admin" ? "管理员" : "普通用户"}${dropped ? `，并清空 ${dropped} 条排队消息` : ""}`
+  }
+
+  const toolMatch = text.trim().match(/^\/(allow-tool|deny-tool)\s+(\S+)\s+(\S+)$/i)
+  if (toolMatch) {
+    if (!access.isAdmin(userId)) return "【提示】只有管理员可以设置工具权限"
+    const operation = toolMatch[1]
+    const target = toolMatch[2]
+    const toolValue = toolMatch[3]
+    if (!operation || !target || !toolValue) return "【提示】命令格式不正确，发送 /help 查看用法"
+    const tool = toolValue.toLowerCase()
+    if (!knownUser(target)) return "【提示】用户不存在，请先发送 /users 查看用户ID"
+    if (!AccessStore.isSafeTool(tool)) {
+      return `【提示】不支持的工具，可设置：${SAFE_USER_TOOLS.join("、")}`
+    }
+    const allowed = operation.toLowerCase() === "allow-tool"
+    access.setTool(target, tool, allowed)
+    const dropped = stopUserWork(target)
+    return `【提示】已${allowed ? "允许" : "禁用"} ${target} 的 ${tool} 工具${dropped ? `，并清空 ${dropped} 条排队消息` : ""}`
+  }
+
+  const pathMatch = text.trim().match(/^\/(allow-path|deny-path)\s+(\S+)\s+(.+)$/i)
+  if (pathMatch) {
+    if (!access.isAdmin(userId)) return "【提示】只有管理员可以设置路径权限"
+    const operation = pathMatch[1]
+    const target = pathMatch[2]
+    const pathValue = pathMatch[3]
+    if (!operation || !target || !pathValue) return "【提示】命令格式不正确，发送 /help 查看用法"
+    if (!knownUser(target)) return "【提示】用户不存在，请先发送 /users 查看用户ID"
+    const allowed = operation.toLowerCase() === "allow-path"
+    try {
+      const path = access.setPath(target, pathValue, allowed)
+      const dropped = stopUserWork(target)
+      return `【提示】已${allowed ? "允许访问" : "移除路径"} ${path}${dropped ? `，并清空 ${dropped} 条排队消息` : ""}`
+    } catch (error) {
+      return `【提示】设置失败：${error instanceof Error ? error.message : String(error)}`
+    }
+  }
+
+  if (/^\/(role|permissions|allow-tool|deny-tool|allow-path|deny-path)\b/i.test(text.trim())) {
+    return "【提示】命令格式不正确，发送 /help 查看用法"
   }
   return null
 }

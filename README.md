@@ -83,6 +83,20 @@ systemctl enable --now mimocode-server.service wechat-mimocode-bot.service
 /compact  发送 /compact 给 MiMoCode，让它压缩当前长期会话
 ```
 
+管理员还可以直接在微信中维护角色和受限用户权限：
+
+```text
+/users
+/role <用户ID> admin|user
+/permissions <用户ID>
+/allow-tool <用户ID> read|edit|glob|grep|list|lsp
+/deny-tool <用户ID> read|edit|glob|grep|list|lsp
+/allow-path <用户ID> <Linux绝对路径>
+/deny-path <用户ID> <Linux绝对路径>
+```
+
+权限配置持久化到 `data/access.json`。Bot 不接受任意 MiMoCode JSON；角色或权限改变时会中断目标用户的当前任务并清空其排队消息，下一次请求自动使用新权限，同时保留 MiMoCode 上下文。
+
 `【提示】` 或 `[提示]` 开头的消息不会发送给 AI，也不会进入对话历史。
 
 ## 配置
@@ -98,6 +112,7 @@ MIMO_SERVER_PORT=4096
 BOT_PORT=3000
 WECHAT_ILINK_STATE_DIR=/data/projects/wechat-bot/data/ilink
 WECHAT_ADMIN_USER_ID=首位微信用户的_iLink_ID
+WECHAT_ACCESS_FILE=/data/projects/wechat-bot/data/access.json
 ```
 
 DeepSeek 系列默认按 1M 上下文显示占用量。

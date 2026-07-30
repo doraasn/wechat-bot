@@ -242,7 +242,7 @@ async function sendWeChatMedia(to: string, filePath: string): Promise<string | n
 // ─── Commands ─────────────────────────────────────────────────
 const USER_HELP = `## 可用命令
 
-- \`/h\`：查看可用命令
+- \`/help\`：查看可用命令
 - \`/stop\`：中断当前回复并清空队列
 - \`/clear\`：清空历史，下次消息开启新会话
 - \`/stats\`：查看会话统计
@@ -306,14 +306,14 @@ function formatPermissions(userId: string): string {
 function handleCommand(userId: string, text: string): string | null {
   const cmd = text.trim().toLowerCase()
   access.ensureUser(userId)
-  if (cmd === "/h") {
+  if (cmd === "/help") {
     return USER_HELP + (
       access.isAdmin(userId)
-        ? "\n- `/admin-h`：查看管理员命令"
+        ? "\n- `/admin-help`：查看管理员命令"
         : ""
     )
   }
-  if (cmd === "/admin-h") {
+  if (cmd === "/admin-help") {
     return access.isAdmin(userId)
       ? ADMIN_HELP
       : "【提示】只有管理员可以查看管理员命令"
@@ -384,7 +384,7 @@ function handleCommand(userId: string, text: string): string | null {
     if (!access.isAdmin(userId)) return "【提示】只有管理员可以设置角色"
     const target = roleMatch[1]
     const roleValue = roleMatch[2]
-    if (!target || !roleValue) return "【提示】命令格式不正确，发送 /admin-h 查看用法"
+    if (!target || !roleValue) return "【提示】命令格式不正确，发送 /admin-help 查看用法"
     if (!knownUser(target)) return "【提示】用户不存在，请先发送 /users 查看用户ID"
     const role = roleValue.toLowerCase() as "admin" | "user"
     const changed = access.setRole(target, role)
@@ -399,7 +399,7 @@ function handleCommand(userId: string, text: string): string | null {
     const operation = toolMatch[1]
     const target = toolMatch[2]
     const toolValue = toolMatch[3]
-    if (!operation || !target || !toolValue) return "【提示】命令格式不正确，发送 /admin-h 查看用法"
+    if (!operation || !target || !toolValue) return "【提示】命令格式不正确，发送 /admin-help 查看用法"
     const tool = toolValue.toLowerCase()
     if (!knownUser(target)) return "【提示】用户不存在，请先发送 /users 查看用户ID"
     if (!AccessStore.isSafeTool(tool)) {
@@ -417,7 +417,7 @@ function handleCommand(userId: string, text: string): string | null {
     const operation = pathMatch[1]
     const target = pathMatch[2]
     const pathValue = pathMatch[3]
-    if (!operation || !target || !pathValue) return "【提示】命令格式不正确，发送 /admin-h 查看用法"
+    if (!operation || !target || !pathValue) return "【提示】命令格式不正确，发送 /admin-help 查看用法"
     if (!knownUser(target)) return "【提示】用户不存在，请先发送 /users 查看用户ID"
     const allowed = operation.toLowerCase() === "allow-path"
     try {
@@ -430,7 +430,7 @@ function handleCommand(userId: string, text: string): string | null {
   }
 
   if (/^\/(role|permissions|allow-tool|deny-tool|allow-path|deny-path)\b/i.test(text.trim())) {
-    return "【提示】命令格式不正确，发送 /admin-h 查看用法"
+    return "【提示】命令格式不正确，发送 /admin-help 查看用法"
   }
   return null
 }

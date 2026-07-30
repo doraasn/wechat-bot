@@ -1,6 +1,6 @@
 const CHAINABLE_COMMANDS = new Set([
-  "/h",
-  "/admin-h",
+  "/help",
+  "/admin-help",
   "/stop",
   "/clear",
   "/stats",

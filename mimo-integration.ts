@@ -1,6 +1,14 @@
 import { mkdirSync } from "fs"
 
-const DEFAULT_TIMEOUT_MS = 300_000
+export function resolveRequestTimeoutMs(value?: string): number {
+  const configured = Number.parseInt(value ?? "0", 10)
+  return Number.isFinite(configured) ? Math.max(0, configured) : 0
+}
+
+// 0 表示不限制处理时长，由微信用户通过 /stop 主动中断。
+const DEFAULT_TIMEOUT_MS = resolveRequestTimeoutMs(
+  process.env.MIMO_REQUEST_TIMEOUT_MS,
+)
 const ABORT_WAIT_MS = 5_000
 const STATUS_POLL_MS = 100
 const MIMO_SERVER_URL = process.env.MIMO_SERVER_URL ?? "http://127.0.0.1:4096"
@@ -344,9 +352,11 @@ export async function askMimo(
   const abortListener = () => abortAndFinish("aborted")
   signal?.addEventListener("abort", abortListener, { once: true })
 
-  const timeout = setTimeout(() => {
-    abortAndFinish("timeout")
-  }, timeoutMs)
+  const timeout = timeoutMs > 0
+    ? setTimeout(() => {
+        abortAndFinish("timeout")
+      }, timeoutMs)
+    : undefined
 
   function handleEvent(event: ServerEvent): void {
     const properties = event.properties
@@ -478,7 +488,7 @@ export async function askMimo(
     eventError = error instanceof Error ? error.message : String(error)
     finish()
   } finally {
-    clearTimeout(timeout)
+    if (timeout) clearTimeout(timeout)
     signal?.removeEventListener("abort", abortListener)
     if (abortPromise) await abortPromise
     eventController.abort()

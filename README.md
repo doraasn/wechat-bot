@@ -8,6 +8,8 @@
 - 普通消息按用户串行排队，并持久化到用户工作区；进程重启后自动恢复
 - `/stop` 中断当前任务并清空队列，但保留长期会话
 - `/compact` 原样发送给 MiMoCode，用于压缩上下文
+- 默认不设置任务超时，长任务持续等待，直到完成或用户发送 `/stop`
+- 无参数命令后可直接追加下一条要求，例如 `/stop 检查最新日志`
 - AI 回复末尾追加精简状态：时间、耗时、上下文占用、输入/输出 token
 - MiMoCode 产生阶段性文本后立即推送到微信，不使用定时进度提醒
 - 主动触发微信“正在输入”状态
@@ -112,6 +114,7 @@ MIMO_MODEL_ID=deepseek-v4-flash
 MIMO_CONTEXT_LIMIT_TOKENS=1000000
 MIMO_SERVER_URL=http://127.0.0.1:4096
 MIMO_SERVER_PORT=4096
+MIMO_REQUEST_TIMEOUT_MS=0
 BOT_PORT=3000
 WECHAT_ILINK_STATE_DIR=/data/projects/wechat-bot/data/ilink
 WECHAT_ADMIN_USER_ID=首位微信用户的_iLink_ID
@@ -120,6 +123,8 @@ WECHAT_MEDIA_MAX_BYTES=104857600
 ```
 
 DeepSeek 系列默认按 1M 上下文显示占用量。
+
+`MIMO_REQUEST_TIMEOUT_MS=0` 表示不限制单次任务时长。设置为正整数时，单位为毫秒。
 
 微信账号、Token、同步游标和发送上下文保存在 `data/ilink/`，该目录不会提交到 Git。
 

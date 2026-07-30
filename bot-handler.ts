@@ -10,6 +10,7 @@ import {
   type MimoPermissionRule,
 } from "./mimo-integration"
 import { AccessStore, SAFE_USER_TOOLS } from "./access-store"
+import { splitChainedCommand } from "./command-utils"
 import { extractOutgoingAttachments } from "./ilink-media"
 import { ILinkClient } from "./ilink-client"
 import { Hono } from "hono"
@@ -245,7 +246,9 @@ const USER_HELP = `## 可用命令
 - \`/stop\`：中断当前回复并清空队列
 - \`/clear\`：清空历史，下次消息开启新会话
 - \`/stats\`：查看会话统计
-- \`/compact\`：压缩当前长期会话`
+- \`/compact\`：压缩当前长期会话
+
+命令后可直接追加下一条要求，例如：\`/stop 检查最新日志\``
 
 const ADMIN_HELP = `## 管理员命令
 
@@ -607,9 +610,22 @@ async function handleInbound(from: string, text: string): Promise<void> {
     return
   }
 
-  const cmdReply = handleCommand(from, text)
+  const chained = splitChainedCommand(text)
+  if (chained?.command === "/compact") {
+    enqueueMessage(from, chained.command)
+    enqueueMessage(from, chained.followUp)
+    runNextMessage(from)
+    return
+  }
+
+  const commandText = chained?.command ?? text
+  const cmdReply = handleCommand(from, commandText)
   if (cmdReply !== null) {
     await sendWeChat(from, cmdReply)
+    if (chained) {
+      enqueueMessage(from, chained.followUp)
+      runNextMessage(from)
+    }
     return
   }
 

@@ -1,3 +1,5 @@
+import { normalizeTrailingColon } from "./text-format"
+
 /**
  * 合并 MiMoCode 的阶段性输出；只有静默达到指定时间后才推送。
  * 最终回复到达时可直接丢弃尚未发送的阶段性内容。
@@ -14,7 +16,7 @@ export class ProgressDebouncer {
   ) {}
 
   push(text?: string): void {
-    const value = text?.trim()
+    const value = text ? normalizeTrailingColon(text.trim()) : ""
     if (!value || this.closed) return
     this.parts.push(value)
     if (this.timer) clearTimeout(this.timer)

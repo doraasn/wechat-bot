@@ -1,4 +1,5 @@
 import { mkdirSync } from "fs"
+import { normalizeTrailingColon } from "./text-format"
 
 export function resolveRequestTimeoutMs(value?: string): number {
   const configured = Number.parseInt(value ?? "0", 10)
@@ -316,7 +317,11 @@ export async function askMimo(
     }
   })
 
-  const currentText = () => [...textParts.values()].join("\n").trim()
+  const currentText = () => [...textParts.values()]
+    .map((text) => normalizeTrailingColon(text.trim()))
+    .filter(Boolean)
+    .join("\n")
+    .trim()
   const reportProgress = (delta?: string) => {
     onProgress?.({
       text: currentText(),
@@ -331,7 +336,8 @@ export async function askMimo(
     const deltas: string[] = []
     for (const partId of pendingTextPartIds) {
       if (reportedTextPartIds.has(partId)) continue
-      const text = textParts.get(partId)?.trim()
+      const rawText = textParts.get(partId)?.trim()
+      const text = rawText ? normalizeTrailingColon(rawText) : ""
       if (text) deltas.push(text)
       reportedTextPartIds.add(partId)
     }

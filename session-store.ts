@@ -39,6 +39,14 @@ export interface QueuedMessage {
   text: string
   receivedAt: number
   startedAt?: number
+  pendingReply?: {
+    text: string
+    deliveryId: string
+    files: string[]
+    nextFileIndex: number
+    mediaNotice?: string
+    historyRecorded?: boolean
+  }
 }
 
 export class SessionStore {
@@ -207,6 +215,18 @@ export class SessionStore {
         && typeof item?.text === "string"
         && typeof item?.receivedAt === "number"
         && (item?.startedAt === undefined || typeof item.startedAt === "number")
+        && (
+          item?.pendingReply === undefined
+          || (
+            typeof item.pendingReply?.text === "string"
+            && typeof item.pendingReply?.deliveryId === "string"
+            && Array.isArray(item.pendingReply?.files)
+            && item.pendingReply.files.every((file: unknown) => typeof file === "string")
+            && typeof item.pendingReply?.nextFileIndex === "number"
+            && (item.pendingReply?.mediaNotice === undefined || typeof item.pendingReply.mediaNotice === "string")
+            && (item.pendingReply?.historyRecorded === undefined || typeof item.pendingReply.historyRecorded === "boolean")
+          )
+        )
       )
     } catch {
       return []

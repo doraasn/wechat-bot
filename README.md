@@ -11,7 +11,8 @@
 - 默认不设置任务超时，长任务持续等待，直到完成或用户发送 `/stop`
 - 无参数命令后可直接追加下一条要求，例如 `/stop 检查最新日志`
 - AI 回复末尾追加精简状态：时间、耗时、上下文占用、输入/输出 token
-- MiMoCode 产生阶段性文本后立即推送到微信，不使用定时进度提醒
+- MiMoCode 阶段性文本按静默窗口合并；窗口内有新内容就重新计时，最终回复到达时直接丢弃未发送进度
+- 最终回复校验微信业务回执并使用固定消息 ID 重试；多次失败时持久化等待重发，不会重新执行 MiMoCode 任务
 - 主动触发微信“正在输入”状态
 - 原样发送 Markdown，支持微信表格、标题、粗体和引用渲染
 - 接收图片、视频、语音和普通文件，按用户与日期归档到 `attachments/YYYY-MM-DD/`
@@ -120,11 +121,15 @@ WECHAT_ILINK_STATE_DIR=/data/projects/wechat-bot/data/ilink
 WECHAT_ADMIN_USER_ID=首位微信用户的_iLink_ID
 WECHAT_ACCESS_FILE=/data/projects/wechat-bot/data/access.json
 WECHAT_MEDIA_MAX_BYTES=104857600
+WECHAT_PROGRESS_DEBOUNCE_MS=15000
+WECHAT_DELIVERY_RETRY_DELAY_MS=30000
 ```
 
 DeepSeek 系列默认按 1M 上下文显示占用量。
 
 `MIMO_REQUEST_TIMEOUT_MS=0` 表示不限制单次任务时长。设置为正整数时，单位为毫秒。
+
+`WECHAT_PROGRESS_DEBOUNCE_MS` 是阶段性输出的静默合并窗口；窗口内每次出现新内容都会重新计时。`WECHAT_DELIVERY_RETRY_DELAY_MS` 是最终回复经过接口内三次重试后仍发送失败时，持久化队列再次尝试投递的间隔。
 
 微信账号、Token、同步游标和发送上下文保存在 `data/ilink/`，该目录不会提交到 Git。
 

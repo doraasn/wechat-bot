@@ -28,6 +28,7 @@ const LONG_POLL_TIMEOUT_MS = 35_000
 const API_TIMEOUT_MS = 15_000
 const RETRY_DELAY_MS = 2_000
 const BACKOFF_DELAY_MS = 30_000
+const SEND_RETRY_ATTEMPTS = 3
 
 const MessageType = { USER: 1, BOT: 2 } as const
 const MessageItemType = { TEXT: 1, IMAGE: 2, VOICE: 3, FILE: 4, VIDEO: 5 } as const
@@ -64,6 +65,20 @@ type SendContext = {
 }
 
 type PersistedContexts = Record<string, SendContext>
+
+type SendMessageResponse = {
+  ret?: number
+  errcode?: number
+  errmsg?: string
+}
+
+export function assertSendMessageResponse(response: SendMessageResponse): void {
+  const ret = response.ret ?? 0
+  const errcode = response.errcode ?? 0
+  if (ret !== 0 || errcode !== 0) {
+    throw new Error(`微信发送失败：ret=${ret} errcode=${errcode} ${response.errmsg ?? ""}`.trim())
+  }
+}
 
 export type ILinkInboundMessage = {
   id: string
@@ -277,6 +292,31 @@ export class ILinkClient {
     }
   }
 
+  /** 使用同一个 client_id 重试，依靠微信侧幂等避免产生重复消息。 */
+  private async sendMessageWithRetry(
+    accountId: string,
+    payload: Record<string, unknown>,
+    clientId: string,
+  ): Promise<void> {
+    let lastError: unknown
+    for (let attempt = 1; attempt <= SEND_RETRY_ATTEMPTS; attempt++) {
+      try {
+        const response = await this.request<SendMessageResponse>(
+          accountId,
+          "ilink/bot/sendmessage",
+          payload,
+        )
+        assertSendMessageResponse(response)
+        return
+      } catch (error) {
+        lastError = error
+        console.log(`[send] attempt=${attempt}/${SEND_RETRY_ATTEMPTS} client=${clientId} failed: ${error}`)
+        if (attempt < SEND_RETRY_ATTEMPTS) await Bun.sleep(attempt * RETRY_DELAY_MS)
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError))
+  }
+
   private async rememberContext(
     accountId: string,
     userId: string,
@@ -426,16 +466,19 @@ export class ILinkClient {
     console.log(`[ilink] stopped account=${accountId}`)
   }
 
-  async sendText(to: string, markdown: string): Promise<void> {
+  async sendText(to: string, markdown: string, deliveryId: string = crypto.randomUUID()): Promise<void> {
     const context = this.contexts.get(to)
     if (!context?.contextToken) throw new Error(`用户 ${to} 缺少 context_token`)
     const accountId = this.contextAccountId(to, context)
-    for (const chunk of splitMarkdown(markdown)) {
-      await this.request(accountId, "ilink/bot/sendmessage", {
+    const chunks = splitMarkdown(markdown)
+    for (let index = 0; index < chunks.length; index++) {
+      const chunk = chunks[index] ?? ""
+      const clientId = `wechat-mimo-${deliveryId}-${index}`
+      await this.sendMessageWithRetry(accountId, {
         msg: {
           from_user_id: "",
           to_user_id: to,
-          client_id: `wechat-mimo-${crypto.randomUUID()}`,
+          client_id: clientId,
           message_type: MessageType.BOT,
           message_state: MessageState.FINISH,
           item_list: [{
@@ -444,12 +487,12 @@ export class ILinkClient {
           }],
           context_token: context.contextToken,
         },
-      })
+      }, clientId)
     }
   }
 
   /** 上传并发送图片、视频或普通文件。 */
-  async sendMedia(to: string, filePath: string): Promise<void> {
+  async sendMedia(to: string, filePath: string, deliveryId: string = crypto.randomUUID()): Promise<void> {
     // 允许诊断脚本只初始化发送端，不启动 getupdates 长轮询。
     if (!this.accounts.size) this.loadAccounts()
     const context = this.contexts.get(to)
@@ -467,17 +510,18 @@ export class ILinkClient {
       getUploadUrl: (payload) =>
         this.request(accountId, "ilink/bot/getuploadurl", payload),
     })
-    await this.request(accountId, "ilink/bot/sendmessage", {
+    const clientId = `wechat-mimo-${deliveryId}`
+    await this.sendMessageWithRetry(accountId, {
       msg: {
         from_user_id: "",
         to_user_id: to,
-        client_id: `wechat-mimo-${crypto.randomUUID()}`,
+        client_id: clientId,
         message_type: MessageType.BOT,
         message_state: MessageState.FINISH,
         item_list: [item],
         context_token: context.contextToken,
       },
-    })
+    }, clientId)
   }
 
   async sendTyping(to: string, typing: boolean): Promise<void> {

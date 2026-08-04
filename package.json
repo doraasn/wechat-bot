@@ -5,6 +5,7 @@
   "scripts": {
     "bot": "bun run bot-handler.ts",
     "login": "bun run ilink-login.ts",
+    "test": "bun test",
     "typecheck": "bunx tsc --noEmit"
   },
   "devDependencies": {

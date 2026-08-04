@@ -13,11 +13,13 @@ import { AccessStore, SAFE_USER_TOOLS } from "./access-store"
 import { splitChainedCommand } from "./command-utils"
 import { extractOutgoingAttachments } from "./ilink-media"
 import { ILinkClient } from "./ilink-client"
+import { ProgressDebouncer } from "./progress-debouncer"
 import { Hono } from "hono"
 
 const app = new Hono()
 const ilink = new ILinkClient()
-const PROGRESS_CHUNK_CHARS = 1_500
+const PROGRESS_DEBOUNCE_MS = parseInt(process.env.WECHAT_PROGRESS_DEBOUNCE_MS ?? "15000", 10)
+const DELIVERY_RETRY_DELAY_MS = parseInt(process.env.WECHAT_DELIVERY_RETRY_DELAY_MS ?? "30000", 10)
 const TYPING_REFRESH_MS = 20_000
 const DEFAULT_PROVIDER_ID = process.env.MIMO_PROVIDER_ID ?? "deepseek"
 const DEFAULT_MODEL_ID = process.env.MIMO_MODEL_ID ?? "deepseek-v4-flash"
@@ -99,6 +101,7 @@ function checkRateLimit(userId: string, text: string): boolean {
 // ─── Active tasks tracking ────────────────────────────────────
 const activeTasks = new Map<string, AbortController>()
 const pendingQueues = new Map<string, QueuedMessage[]>()
+const deliveryRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
 for (const userId of sessions.listUsers()) {
   const queue = sessions.loadQueue(userId)
@@ -189,16 +192,6 @@ function buildReplyMeta(elapsedMs: number, tokens?: { total: number; input: numb
   return parts.join("｜")
 }
 
-function splitProgress(text: string): string[] {
-  const compact = text.trim()
-  if (!compact) return []
-  const chunks: string[] = []
-  for (let offset = 0; offset < compact.length; offset += PROGRESS_CHUNK_CHARS) {
-    chunks.push(compact.slice(offset, offset + PROGRESS_CHUNK_CHARS))
-  }
-  return chunks
-}
-
 function formatErrorMessage(
   error: string | undefined,
   elapsedMs: number,
@@ -220,6 +213,12 @@ async function sendWeChat(to: string, text: string) {
   }
 }
 
+/** 最终回复必须获得微信业务成功回执，否则由持久化队列稍后重试。 */
+async function sendWeChatRequired(to: string, text: string, deliveryId: string): Promise<void> {
+  await ilink.sendText(to, text, deliveryId)
+  console.log(`[send] confirmed to=${to} delivery=${deliveryId}`)
+}
+
 async function sendTyping(to: string, status: "start" | "stop") {
   try {
     await ilink.sendTyping(to, status === "start")
@@ -228,13 +227,17 @@ async function sendTyping(to: string, status: "start" | "stop") {
   }
 }
 
-async function sendWeChatMedia(to: string, filePath: string): Promise<string | null> {
+async function sendWeChatMediaRequired(
+  to: string,
+  filePath: string,
+  deliveryId: string,
+): Promise<string | null> {
   try {
-    await ilink.sendMedia(to, filePath)
+    await ilink.sendMedia(to, filePath, deliveryId)
     return null
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
-    console.log(`[send-media] failed to=${to} file=${filePath}: ${detail}`)
+    console.log(`[send-media] failed to=${to} file=${filePath} delivery=${deliveryId}: ${detail}`)
     return `${filePath}：${detail}`
   }
 }
@@ -456,12 +459,29 @@ function peekMessage(userId: string): QueuedMessage | undefined {
 }
 
 function completeMessage(userId: string, messageId: string): void {
+  const retryTimer = deliveryRetryTimers.get(userId)
+  if (retryTimer) clearTimeout(retryTimer)
+  deliveryRetryTimers.delete(userId)
   const queue = pendingQueues.get(userId)
   if (!queue) return
   const remaining = queue.filter((item) => item.id !== messageId)
   if (remaining.length) pendingQueues.set(userId, remaining)
   else pendingQueues.delete(userId)
   sessions.saveQueue(userId, remaining)
+}
+
+function persistQueue(userId: string): void {
+  sessions.saveQueue(userId, pendingQueues.get(userId) ?? [])
+}
+
+function scheduleDeliveryRetry(userId: string): void {
+  if (deliveryRetryTimers.has(userId)) return
+  const timer = setTimeout(() => {
+    deliveryRetryTimers.delete(userId)
+    runNextMessage(userId)
+  }, DELIVERY_RETRY_DELAY_MS)
+  deliveryRetryTimers.set(userId, timer)
+  console.log(`[send] final reply queued for retry user=${userId} delay=${DELIVERY_RETRY_DELAY_MS}ms`)
 }
 
 function markMessageStarted(userId: string, messageId: string): boolean {
@@ -474,6 +494,9 @@ function markMessageStarted(userId: string, messageId: string): boolean {
 }
 
 function clearQueue(userId: string): void {
+  const retryTimer = deliveryRetryTimers.get(userId)
+  if (retryTimer) clearTimeout(retryTimer)
+  deliveryRetryTimers.delete(userId)
   pendingQueues.delete(userId)
   sessions.saveQueue(userId, [])
 }
@@ -488,6 +511,39 @@ function runNextMessage(userId: string): void {
 }
 
 // ─── Async processing ─────────────────────────────────────────
+async function deliverPendingReply(from: string, queuedMessage: QueuedMessage): Promise<void> {
+  const pending = queuedMessage.pendingReply
+  if (!pending) return
+
+  await sendWeChatRequired(from, pending.text, pending.deliveryId)
+  if (!pending.historyRecorded) {
+    sessions.addMessage(from, "assistant", pending.text)
+    pending.historyRecorded = true
+    persistQueue(from)
+  }
+
+  const mediaErrors: string[] = []
+  for (let index = pending.nextFileIndex; index < pending.files.length; index++) {
+    const filePath = pending.files[index]
+    if (!filePath) continue
+    const error = await sendWeChatMediaRequired(from, filePath, `${pending.deliveryId}-media-${index}`)
+    if (error) mediaErrors.push(error)
+    pending.nextFileIndex = index + 1
+    persistQueue(from)
+  }
+
+  const notices = [pending.mediaNotice, ...mediaErrors].filter(Boolean)
+  if (notices.length) {
+    await sendWeChatRequired(
+      from,
+      `【提示】部分附件未能发送：\n${notices.map((error) => `- ${error}`).join("\n")}`,
+      `${pending.deliveryId}-media-notice`,
+    )
+  }
+  queuedMessage.pendingReply = undefined
+  persistQueue(from)
+}
+
 async function processMessage(from: string, queuedMessage: QueuedMessage, mimoSessionId: string | undefined) {
   if (activeTasks.has(from)) {
     await sendWeChat(from, "【提示】上一条还在处理。发送 /stop 以中断。")
@@ -498,22 +554,33 @@ async function processMessage(from: string, queuedMessage: QueuedMessage, mimoSe
   const startedAt = Date.now()
   const abort = new AbortController()
   activeTasks.set(from, abort)
+
+  // 服务重启或投递失败后只重发最终回复，不重新执行可能带副作用的 MiMoCode 任务。
+  if (queuedMessage.pendingReply) {
+    let delivered = false
+    try {
+      await deliverPendingReply(from, queuedMessage)
+      delivered = true
+    } catch (error) {
+      console.log(`[send] final delivery failed user=${from}: ${error}`)
+      scheduleDeliveryRetry(from)
+    } finally {
+      activeTasks.delete(from)
+    }
+    if (delivered) {
+      completeMessage(from, queuedMessage.id)
+      runNextMessage(from)
+    }
+    return
+  }
+
   if (markMessageStarted(from, queuedMessage.id)) {
     sessions.addMessage(from, "user", text)
   }
-  let progressSendChain = Promise.resolve()
-
-  const queueProgress = (delta?: string) => {
-    if (!delta) return
-    for (const chunk of splitProgress(delta)) {
-      progressSendChain = progressSendChain
-        .then(async () => {
-          if (abort.signal.aborted) return
-          await sendWeChat(from, `【进度】\n\n${chunk}`)
-        })
-        .catch((err) => console.log(`[progress] error: ${err}`))
-    }
-  }
+  const progress = new ProgressDebouncer(PROGRESS_DEBOUNCE_MS, async (merged) => {
+    if (abort.signal.aborted) return
+    await sendWeChat(from, `【进度】\n\n${merged}`)
+  })
 
   await sendTyping(from, "start")
   const typingRetryTimer = setTimeout(() => {
@@ -536,7 +603,7 @@ async function processMessage(from: string, queuedMessage: QueuedMessage, mimoSe
       cwd,
       abort.signal,
       undefined,
-      (progress) => queueProgress(progress.delta),
+      (update) => progress.push(update.delta),
       permission,
     )
 
@@ -552,16 +619,17 @@ async function processMessage(from: string, queuedMessage: QueuedMessage, mimoSe
         cwd,
         abort.signal,
         undefined,
-        (progress) => queueProgress(progress.delta),
+        (update) => progress.push(update.delta),
         permission,
       )
     }
 
-    await progressSendChain
+    // 最终结果优先：取消计时并丢弃尚未投递的进度消息。
+    await progress.discardAndWait()
     if (abort.signal.aborted) return
 
+    const elapsedMs = Date.now() - startedAt
     if (result.success) {
-      const elapsedMs = Date.now() - startedAt
       if (result.sessionId && result.sessionId !== mimoSessionId) {
         const cfg = sessions.getConfig(from)
         sessions.saveConfig(from, { ...cfg, metadata: { ...cfg.metadata, mimoSessionId: result.sessionId } })
@@ -569,32 +637,40 @@ async function processMessage(from: string, queuedMessage: QueuedMessage, mimoSe
       if (result.tokens) console.log(`[mimo] user=${from} tokens=${result.tokens.total}`)
       const outgoing = await extractOutgoingAttachments(result.text, cwd)
       const reply = `${outgoing.text}\n\n${buildReplyMeta(elapsedMs, result.tokens, result.model)}`
-      sessions.addMessage(from, "assistant", reply)
-      await sendWeChat(from, reply)
-      const mediaErrors = [...outgoing.rejected]
-      for (const filePath of outgoing.files) {
-        const error = await sendWeChatMedia(from, filePath)
-        if (error) mediaErrors.push(error)
-      }
-      if (mediaErrors.length) {
-        await sendWeChat(
-          from,
-          `【提示】部分附件未能发送：\n${mediaErrors.map((error) => `- ${error}`).join("\n")}`,
-        )
+      queuedMessage.pendingReply = {
+        text: reply,
+        deliveryId: crypto.randomUUID(),
+        files: outgoing.files,
+        nextFileIndex: 0,
+        mediaNotice: outgoing.rejected.length ? outgoing.rejected.join("\n- ") : undefined,
       }
     } else {
-      const elapsedMs = Date.now() - startedAt
       console.log(`[mimo] FAILED user=${from} error=${result.error} elapsed=${elapsedMs}ms`)
-      await sendWeChat(from, formatErrorMessage(result.error, elapsedMs, result.tokens, result.model))
+      queuedMessage.pendingReply = {
+        text: formatErrorMessage(result.error, elapsedMs, result.tokens, result.model),
+        deliveryId: crypto.randomUUID(),
+        files: [],
+        nextFileIndex: 0,
+      }
     }
+    // 先持久化再发送，进程中断后仍能仅重发最终回复。
+    persistQueue(from)
+    await deliverPendingReply(from, queuedMessage)
   } finally {
-    await progressSendChain
+    await progress.discardAndWait()
     clearTimeout(typingRetryTimer)
     clearInterval(typingInterval)
     await sendTyping(from, "stop")
     activeTasks.delete(from)
-    completeMessage(from, queuedMessage.id)
-    runNextMessage(from)
+    if (abort.signal.aborted) {
+      completeMessage(from, queuedMessage.id)
+      runNextMessage(from)
+    } else if (queuedMessage.pendingReply) {
+      scheduleDeliveryRetry(from)
+    } else {
+      completeMessage(from, queuedMessage.id)
+      runNextMessage(from)
+    }
   }
 }
 

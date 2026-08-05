@@ -5,6 +5,8 @@ describe("normalizeTrailingColon", () => {
   test("替换中文和英文句尾冒号", () => {
     expect(normalizeTrailingColon("继续验证：")).toBe("继续验证。")
     expect(normalizeTrailingColon("continue:")).toBe("continue。")
+    expect(normalizeTrailingColon("继续验证：   ")).toBe("继续验证。")
+    expect(normalizeTrailingColon("continue:\t")).toBe("continue。")
   })
 
   test("保留正文内部冒号和其他句尾", () => {

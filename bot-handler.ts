@@ -739,6 +739,18 @@ app.get("/admin/tasks", (c) => c.json({
   })),
   count: activeTasks.size,
 }))
+// 主动推送消息给指定用户（cron 定时任务用：如工作日午餐菜单推送）
+// curl -X POST http://127.0.0.1:3000/admin/send -H "Content-Type: application/json" -d '{"to":"<userId>","text":"..."}'
+app.post("/admin/send", async (c) => {
+  const body = await c.req.json().catch(() => null)
+  const to = body?.to
+  const text = body?.text
+  if (!to || !text) return c.json({ error: "to 和 text 必填" }, 400)
+  const known = sessions.listUsers()
+  if (!known.includes(to)) return c.json({ error: "未知用户" }, 404)
+  await sendWeChat(to, text)
+  return c.json({ ok: true, to })
+})
 app.get("/health", (c) => c.json({ status: "ok", uptime: process.uptime() }))
 app.get("/ilink/status", (c) => c.json(ilink.status()))
 

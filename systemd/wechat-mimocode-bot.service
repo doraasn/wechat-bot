@@ -11,6 +11,7 @@ WorkingDirectory=/data/projects/wechat-bot
 Environment=HOME=/root
 Environment=PATH=/root/.bun/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=MIMO_SERVER_URL=http://127.0.0.1:4096
+Environment=MIMO_MODEL_ID=deepseek-flash
 Environment=WECHAT_ILINK_STATE_DIR=/data/projects/wechat-bot/data/ilink
 ExecStart=/usr/local/bin/bun run bot-handler.ts
 Restart=always

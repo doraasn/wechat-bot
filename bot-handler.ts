@@ -748,8 +748,15 @@ app.post("/admin/send", async (c) => {
   if (!to || !text) return c.json({ error: "to 和 text 必填" }, 400)
   const known = sessions.listUsers()
   if (!known.includes(to)) return c.json({ error: "未知用户" }, 404)
-  await sendWeChat(to, text)
-  return c.json({ ok: true, to })
+  try {
+    // 直接调用 ilink.sendText：失败会抛错，返回错误状态而非 ok
+    await ilink.sendText(to, text)
+    return c.json({ ok: true, to })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.log(`[admin/send] failed to=${to}: ${msg}`)
+    return c.json({ ok: false, to, error: msg }, 502)
+  }
 })
 app.get("/health", (c) => c.json({ status: "ok", uptime: process.uptime() }))
 app.get("/ilink/status", (c) => c.json(ilink.status()))

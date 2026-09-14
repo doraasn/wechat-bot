@@ -46,6 +46,7 @@ export interface QueuedMessage {
     nextFileIndex: number
     mediaNotice?: string
     historyRecorded?: boolean
+    retryCount?: number
   }
 }
 

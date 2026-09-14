@@ -7,10 +7,19 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import path from "node:path"
 
-const BASE_URL = "https://ilinkai.weixin.qq.com"
+// 默认连微信生产域名；WECHAT_ILINK_BASE_URL 仅用于本地联调与自动化测试。
+const BASE_URL = (
+  process.env.WECHAT_ILINK_BASE_URL ?? "https://ilinkai.weixin.qq.com"
+).replace(/\/+$/, "")
 const STATE_DIR =
   process.env.WECHAT_ILINK_STATE_DIR ??
   "/data/projects/wechat-bot/data/ilink"
+// 二维码过期后自动换新码的次数上限，避免无限重试。
+const QR_REFRESH_MAX = Number.parseInt(
+  process.env.WECHAT_ILINK_QR_REFRESH_MAX ?? "3",
+  10,
+)
+const LOGIN_DEADLINE_MS = 8 * 60_000
 
 type QrResponse = {
   qrcode?: string
@@ -18,11 +27,13 @@ type QrResponse = {
 }
 
 type StatusResponse = {
-  status?: "wait" | "scaned" | "confirmed" | "expired"
+  status?: "wait" | "scaned" | "scaned_but_redirect" | "confirmed" | "expired"
   bot_token?: string
   ilink_bot_id?: string
   baseurl?: string
   ilink_user_id?: string
+  /** 微信要求换机房时给出的域名，后续轮询必须改用它。 */
+  redirect_host?: string
 }
 
 async function fetchJson<T>(url: string, timeoutMs = 35_000): Promise<T> {
@@ -30,6 +41,28 @@ async function fetchJson<T>(url: string, timeoutMs = 35_000): Promise<T> {
   const raw = await response.text()
   if (!response.ok) throw new Error(`HTTP ${response.status}: ${raw}`)
   return JSON.parse(raw) as T
+}
+
+/** 微信可能返回裸域名（无协议），统一补全并去掉结尾斜杠。 */
+function normalizeBaseUrl(value: string): string {
+  const withScheme = /^https?:\/\//i.test(value) ? value : `https://${value}`
+  return withScheme.replace(/\/+$/, "")
+}
+
+async function fetchQrcode(baseUrl: string): Promise<QrResponse> {
+  const qr = await fetchJson<QrResponse>(
+    `${baseUrl}/ilink/bot/get_bot_qrcode?bot_type=3`,
+    15_000,
+  )
+  if (!qr.qrcode || !qr.qrcode_img_content) {
+    throw new Error("获取二维码失败：响应缺少二维码")
+  }
+  return qr
+}
+
+function printQrcode(qr: QrResponse, label: string): void {
+  console.log(label)
+  console.log(qr.qrcode_img_content)
 }
 
 function saveAccount(status: StatusResponse): string {
@@ -69,20 +102,17 @@ function saveAccount(status: StatusResponse): string {
 }
 
 async function main(): Promise<void> {
-  const qrUrl = `${BASE_URL}/ilink/bot/get_bot_qrcode?bot_type=3`
-  const qr = await fetchJson<QrResponse>(qrUrl, 15_000)
-  if (!qr.qrcode || !qr.qrcode_img_content) {
-    throw new Error("获取二维码失败：响应缺少二维码")
-  }
-
-  console.log("请使用微信扫描以下二维码并在手机端确认：")
-  console.log(qr.qrcode_img_content)
+  let baseUrl = BASE_URL
+  let qr = await fetchQrcode(baseUrl)
+  printQrcode(qr, "请使用微信扫描以下二维码并在手机端确认：")
   console.log("等待确认，最长 8 分钟……")
 
-  const deadline = Date.now() + 8 * 60_000
+  const deadline = Date.now() + LOGIN_DEADLINE_MS
   let scanned = false
+  let refreshCount = 0
+
   while (Date.now() < deadline) {
-    const url = `${BASE_URL}/ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qr.qrcode)}`
+    const url = `${baseUrl}/ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qr.qrcode ?? "")}`
     let status: StatusResponse
     try {
       const response = await fetch(url, {
@@ -95,11 +125,29 @@ async function main(): Promise<void> {
       throw error
     }
 
+    // 微信把该次登录导流到其他机房：后续轮询必须换成 redirect_host，
+    // 否则会一直原地等待直到 8 分钟超时。
+    if (status.status === "scaned_but_redirect" && status.redirect_host) {
+      baseUrl = normalizeBaseUrl(status.redirect_host)
+      continue
+    }
+
     if (status.status === "scaned" && !scanned) {
       scanned = true
       console.log("已扫码，请在手机端确认……")
     }
-    if (status.status === "expired") throw new Error("二维码已过期，请重新执行登录")
+
+    if (status.status === "expired") {
+      if (refreshCount >= QR_REFRESH_MAX) {
+        throw new Error(`二维码连续 ${QR_REFRESH_MAX} 次过期，请重新执行登录`)
+      }
+      refreshCount += 1
+      qr = await fetchQrcode(baseUrl)
+      scanned = false
+      printQrcode(qr, `二维码已过期，已自动刷新（${refreshCount}/${QR_REFRESH_MAX}）：`)
+      continue
+    }
+
     if (status.status === "confirmed") {
       const accountId = saveAccount(status)
       console.log(`登录成功，账号：${accountId}`)

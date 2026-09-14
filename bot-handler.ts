@@ -8,7 +8,10 @@ import { sessions, type QueuedMessage } from "./session-store"
 import {
   askMimo,
   type MimoPermissionRule,
+  type MimoTokenUsage,
+  type MimoUsage,
 } from "./mimo-integration"
+import { describeUsage, formatStatusTable } from "./usage-report"
 import { AccessStore, SAFE_USER_TOOLS } from "./access-store"
 import { splitChainedCommand } from "./command-utils"
 import { extractOutgoingAttachments } from "./ilink-media"
@@ -20,6 +23,13 @@ const app = new Hono()
 const ilink = new ILinkClient()
 const PROGRESS_DEBOUNCE_MS = parseInt(process.env.WECHAT_PROGRESS_DEBOUNCE_MS ?? "15000", 10)
 const DELIVERY_RETRY_DELAY_MS = parseInt(process.env.WECHAT_DELIVERY_RETRY_DELAY_MS ?? "30000", 10)
+// 投递重试上限与 client_id(即 deliveryId) 轮换周期。
+// 微信按 client_id 幂等：某次投递失败后，同一个 client_id 可能被永久拒绝（ret=-2
+// prepare failed）。若一直复用同一个 id 重试，会表现为"每 30 秒失败一次、永不成功，
+// 且把该用户后续所有消息堵在队列里"（2026-09-11~14 实际连续堵了 3 天）。
+// 因此每失败 N 次换一个新 deliveryId 重投，并在超过上限后放弃、提示用户并继续处理队列。
+const DELIVERY_RETRY_LIMIT = parseInt(process.env.WECHAT_DELIVERY_RETRY_LIMIT ?? "30", 10)
+const DELIVERY_ID_ROTATE_EVERY = parseInt(process.env.WECHAT_DELIVERY_ROTATE_EVERY ?? "3", 10)
 const TYPING_REFRESH_MS = 20_000
 const DEFAULT_PROVIDER_ID = process.env.MIMO_PROVIDER_ID ?? "deepseek"
 const DEFAULT_MODEL_ID = process.env.MIMO_MODEL_ID ?? "deepseek-v4-flash"
@@ -144,9 +154,9 @@ function formatCompactDuration(ms: number): string {
   const hours = Math.floor(totalSeconds / 3600)
   const minutes = Math.floor((totalSeconds % 3600) / 60)
   const seconds = totalSeconds % 60
-  if (hours > 0) return `${hours}h${minutes}'${seconds}''`
-  if (minutes > 0) return `${minutes}'${seconds}''`
-  return `${seconds}''`
+  if (hours > 0) return `${hours}h${minutes}'${seconds}"`
+  if (minutes > 0) return `${minutes}'${seconds}"`
+  return `${seconds}"`
 }
 
 function resolveModel(model?: MimoModel): Required<MimoModel> {
@@ -179,29 +189,43 @@ function compactModelName(model?: MimoModel): string {
   return resolveModel(model).modelID
 }
 
-function buildReplyMeta(elapsedMs: number, tokens?: { total: number; input: number; output: number }, model?: MimoModel): string {
-  const parts = [
-    formatCompactTimestamp(),
-    formatCompactDuration(elapsedMs),
-  ]
-  if (tokens) {
-    const contextLimit = contextLimitForModel(model)
-    const percent = contextLimit > 0 ? ((tokens.total / contextLimit) * 100).toFixed(1) : "0.0"
-    parts.push(`${formatTokenCount(tokens.total)}/${formatTokenCount(contextLimit)}(${percent}%)`)
-  }
-  return parts.join("｜")
+type ReplyMetaInput = {
+  elapsedMs: number
+  tokens?: MimoTokenUsage
+  usage?: MimoUsage
+  model?: MimoModel
+  cwd: string
 }
 
-function formatErrorMessage(
+/**
+ * 回复末尾的状态信息，用 Markdown 表格给出。
+ * 数据来自 MiMo Server 与 DeepSeek 接口，取不到的字段留空单元格。
+ */
+async function buildReplyMeta(input: ReplyMetaInput): Promise<string> {
+  const summary = await describeUsage(input.model, input.usage, input.cwd)
+  const contextLimit = contextLimitForModel(input.model)
+  const context = input.tokens && contextLimit > 0
+    ? `${formatTokenCount(input.tokens.total)}/${formatTokenCount(contextLimit)}(${((input.tokens.total / contextLimit) * 100).toFixed(1)}%)`
+    : ""
+  return formatStatusTable([
+    formatCompactDuration(input.elapsedMs),
+    summary.cost ? `¥ ${summary.cost}` : "",
+    summary.balance ?? "",
+    summary.hitRate ?? "",
+    context,
+    formatCompactTimestamp(),
+  ])
+}
+
+async function formatErrorMessage(
   error: string | undefined,
-  elapsedMs: number,
-  tokens?: { total: number; input: number; output: number },
-  model?: MimoModel,
-): string {
+  input: ReplyMetaInput,
+): Promise<string> {
+  const meta = await buildReplyMeta(input)
   if (error === "timeout") {
-    return `【提示】处理超时，已耗时 ${formatDuration(elapsedMs)}。发送 /stop 以中断，或发送 /compact 压缩上下文。\n\n${buildReplyMeta(elapsedMs, tokens, model)}`
+    return `【提示】处理超时，已耗时 ${formatDuration(input.elapsedMs)}。发送 /stop 以中断，或发送 /compact 压缩上下文。\n\n${meta}`
   }
-  return `【提示】处理出错：${error ?? "未知错误"}\n\n${buildReplyMeta(elapsedMs, tokens, model)}`
+  return `【提示】处理出错：${error ?? "未知错误"}\n\n${meta}`
 }
 
 // ─── Bridge API: send message to WeChat user ──────────────────
@@ -493,6 +517,38 @@ function markMessageStarted(userId: string, messageId: string): boolean {
   return true
 }
 
+/**
+ * 投递失败后的处理：计数、按周期轮换 deliveryId、超过上限则放弃。
+ * 背景见 DELIVERY_RETRY_LIMIT 的注释——复用同一个 client_id 的重试可能永远失败。
+ */
+async function handleDeliveryFailure(userId: string, queuedMessage: QueuedMessage): Promise<void> {
+  const pending = queuedMessage.pendingReply
+  if (!pending) return
+
+  pending.retryCount = (pending.retryCount ?? 0) + 1
+
+  if (pending.retryCount > DELIVERY_RETRY_LIMIT) {
+    console.log(`[send] 放弃投递 user=${userId} 已重试 ${pending.retryCount} 次`)
+    queuedMessage.pendingReply = undefined
+    completeMessage(userId, queuedMessage.id)
+    // 用新的 client_id 尽量把"有回复未送达"这件事告诉用户，然后继续处理队列
+    await sendWeChat(
+      userId,
+      `【提示】有一条回复尝试 ${pending.retryCount} 次仍未送达，已放弃。内容开头：${pending.text.slice(0, 80)}`,
+    )
+    runNextMessage(userId)
+    return
+  }
+
+  if (pending.retryCount % DELIVERY_ID_ROTATE_EVERY === 0) {
+    pending.deliveryId = crypto.randomUUID()
+    console.log(`[send] 轮换 deliveryId user=${userId} retry=${pending.retryCount}`)
+  }
+
+  persistQueue(userId)
+  scheduleDeliveryRetry(userId)
+}
+
 function clearQueue(userId: string): void {
   const retryTimer = deliveryRetryTimers.get(userId)
   if (retryTimer) clearTimeout(retryTimer)
@@ -563,7 +619,7 @@ async function processMessage(from: string, queuedMessage: QueuedMessage, mimoSe
       delivered = true
     } catch (error) {
       console.log(`[send] final delivery failed user=${from}: ${error}`)
-      scheduleDeliveryRetry(from)
+      await handleDeliveryFailure(from, queuedMessage)
     } finally {
       activeTasks.delete(from)
     }
@@ -636,7 +692,16 @@ async function processMessage(from: string, queuedMessage: QueuedMessage, mimoSe
       }
       if (result.tokens) console.log(`[mimo] user=${from} tokens=${result.tokens.total}`)
       const outgoing = await extractOutgoingAttachments(result.text, cwd)
-      const reply = `${outgoing.text}\n\n${buildReplyMeta(elapsedMs, result.tokens, result.model)}`
+      const meta = await buildReplyMeta({
+        elapsedMs,
+        tokens: result.tokens,
+        usage: result.usage,
+        model: result.model,
+        cwd,
+      })
+      // 正文与状态表格之间固定空一行；附件被剥离后正文可能为空，此时只发表格。
+      const body = outgoing.text.trimEnd()
+      const reply = body ? `${body}\n\n${meta}` : meta
       queuedMessage.pendingReply = {
         text: reply,
         deliveryId: crypto.randomUUID(),
@@ -647,7 +712,13 @@ async function processMessage(from: string, queuedMessage: QueuedMessage, mimoSe
     } else {
       console.log(`[mimo] FAILED user=${from} error=${result.error} elapsed=${elapsedMs}ms`)
       queuedMessage.pendingReply = {
-        text: formatErrorMessage(result.error, elapsedMs, result.tokens, result.model),
+        text: await formatErrorMessage(result.error, {
+          elapsedMs,
+          tokens: result.tokens,
+          usage: result.usage,
+          model: result.model,
+          cwd,
+        }),
         deliveryId: crypto.randomUUID(),
         files: [],
         nextFileIndex: 0,

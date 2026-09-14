@@ -21,6 +21,7 @@ import {
   type IncomingAttachment,
   type MediaMessageItem,
 } from "./ilink-media"
+import { transcribeVoice } from "./voice-transcribe"
 
 const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com"
 const DEFAULT_STATE_DIR = "/data/projects/wechat-bot/data/ilink"
@@ -29,6 +30,11 @@ const API_TIMEOUT_MS = 15_000
 const RETRY_DELAY_MS = 2_000
 const BACKOFF_DELAY_MS = 30_000
 const SEND_RETRY_ATTEMPTS = 3
+// 会话过期错误码：token 失效后微信对所有请求都回 -14，重试没有意义。
+const SESSION_EXPIRED_ERRCODE = -14
+const SESSION_PAUSE_MS = 60 * 60 * 1_000
+// 等待一律分段睡眠，保证停止服务时不会被长退避卡住（实测 30s 退避会拖住 shutdown）。
+const SLEEP_SLICE_MS = 5_000
 
 const MessageType = { USER: 1, BOT: 2 } as const
 const MessageItemType = { TEXT: 1, IMAGE: 2, VOICE: 3, FILE: 4, VIDEO: 5 } as const
@@ -75,6 +81,9 @@ type SendMessageResponse = {
 export function assertSendMessageResponse(response: SendMessageResponse): void {
   const ret = response.ret ?? 0
   const errcode = response.errcode ?? 0
+  if (errcode === SESSION_EXPIRED_ERRCODE) {
+    throw new Error(`微信会话已过期（errcode=-14），需要重新扫码登录：${response.errmsg ?? ""}`.trim())
+  }
   if (ret !== 0 || errcode !== 0) {
     throw new Error(`微信发送失败：ret=${ret} errcode=${errcode} ${response.errmsg ?? ""}`.trim())
   }
@@ -95,6 +104,14 @@ export type ILinkStatus = {
   accounts: number
   users: number
   running: boolean
+}
+
+/** 可被 abort 打断的睡眠：长退避或会话暂停不应阻塞服务停止。 */
+async function interruptibleSleep(ms: number, signal: AbortSignal): Promise<void> {
+  const wakeAt = Date.now() + ms
+  while (!signal.aborted && Date.now() < wakeAt) {
+    await Bun.sleep(Math.min(SLEEP_SLICE_MS, wakeAt - Date.now()))
+  }
 }
 
 function atomicWriteJson(file: string, value: unknown): void {
@@ -391,10 +408,20 @@ export class ILinkClient {
           get_updates_buf: buffer,
         }, LONG_POLL_TIMEOUT_MS)
 
-        if ((response.ret ?? 0) !== 0 || (response.errcode ?? 0) !== 0) {
-          throw new Error(
-            `ret=${response.ret} errcode=${response.errcode} ${response.errmsg ?? ""}`,
-          )
+        const errcode = response.errcode ?? 0
+        if ((response.ret ?? 0) !== 0 || errcode !== 0) {
+          const detail = `ret=${response.ret} errcode=${errcode} ${response.errmsg ?? ""}`.trim()
+          if (errcode === SESSION_EXPIRED_ERRCODE) {
+            // 会话过期后所有请求都会被拒，继续每 30 秒重试只会空转刷日志，
+            // 因此暂停该账号一小时，等人工重新扫码登录。
+            console.log(
+              `[ilink] session expired account=${accountId}（${detail}），暂停 ${SESSION_PAUSE_MS / 60_000} 分钟，需重新扫码登录`,
+            )
+            failures = 0
+            await interruptibleSleep(SESSION_PAUSE_MS, signal)
+            continue
+          }
+          throw new Error(detail)
         }
         failures = 0
         if (response.get_updates_buf) {
@@ -437,8 +464,18 @@ export class ILinkClient {
               mediaErrors.push(detail)
             }
           }
+          // 语音附件本地转写：微信未下发语音文字时，用本地 whisper 兜底识别
+          const voiceTranscripts: string[] = []
+          for (const attachment of attachments) {
+            if (attachment.type !== "voice") continue
+            const transcript = await transcribeVoice(attachment.path)
+            if (transcript) voiceTranscripts.push(transcript)
+          }
           const text = [
             messageText(message.item_list),
+            voiceTranscripts.length
+              ? `【语音转写】\n${voiceTranscripts.map((item) => `- ${item}`).join("\n")}`
+              : "",
             attachmentPrompt(attachments),
             mediaErrors.length
               ? `【附件接收失败】\n${mediaErrors.map((error) => `- ${error}`).join("\n")}`
@@ -459,7 +496,7 @@ export class ILinkClient {
         }
         failures += 1
         console.log(`[ilink] monitor error account=${accountId} (${failures}): ${error}`)
-        await Bun.sleep(failures >= 3 ? BACKOFF_DELAY_MS : RETRY_DELAY_MS)
+        await interruptibleSleep(failures >= 3 ? BACKOFF_DELAY_MS : RETRY_DELAY_MS, signal)
         if (failures >= 3) failures = 0
       }
     }

@@ -13,6 +13,8 @@ Environment=PATH=/root/.bun/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:
 Environment=MIMO_SERVER_URL=http://127.0.0.1:4096
 Environment=MIMO_MODEL_ID=deepseek-flash
 Environment=WECHAT_ILINK_STATE_DIR=/data/projects/wechat-bot/data/ilink
+# 语音消息本地转写（SILK + whisper.cpp），未配置则只收到附件路径
+Environment=WECHAT_VOICE2TEXT=/data/projects/wechat-bot/scripts/voice2text.sh
 ExecStart=/usr/local/bin/bun run bot-handler.ts
 Restart=always
 RestartSec=3

@@ -124,6 +124,10 @@ WECHAT_ACCESS_FILE=/data/projects/wechat-bot/data/access.json
 WECHAT_MEDIA_MAX_BYTES=104857600
 WECHAT_PROGRESS_DEBOUNCE_MS=15000
 WECHAT_DELIVERY_RETRY_DELAY_MS=30000
+WECHAT_DELIVERY_RETRY_LIMIT=30
+WECHAT_DELIVERY_ROTATE_EVERY=3
+WECHAT_VOICE2TEXT=/data/projects/wechat-bot/scripts/voice2text.sh
+WECHAT_VOICE2TEXT_TIMEOUT_MS=180000
 ```
 
 DeepSeek 系列默认按 1M 上下文显示占用量。
@@ -132,7 +136,36 @@ DeepSeek 系列默认按 1M 上下文显示占用量。
 
 `WECHAT_PROGRESS_DEBOUNCE_MS` 是阶段性输出的静默合并窗口；窗口内每次出现新内容都会重新计时。`WECHAT_DELIVERY_RETRY_DELAY_MS` 是最终回复经过接口内三次重试后仍发送失败时，持久化队列再次尝试投递的间隔。
 
+`WECHAT_DELIVERY_RETRY_LIMIT` 与 `WECHAT_DELIVERY_ROTATE_EVERY` 控制投递失败的退避策略：微信按 `client_id` 幂等，同一次投递失败后**同一个 `client_id` 会被持续拒绝**（`ret=-2 prepare failed`），若一直复用同一个 id 重试，会出现"每 30 秒失败一次、永不成功，并把该用户后续消息全部堵在队列里"（2026-09-11~14 实际连续堵了 3 天）。因此每失败 `WECHAT_DELIVERY_ROTATE_EVERY` 次就换一个新的 `deliveryId` 重投，累计超过 `WECHAT_DELIVERY_RETRY_LIMIT` 次则放弃该条、提示用户并继续处理队列。
+
+`WECHAT_VOICE2TEXT` 指向语音转写脚本（见下节）；`WECHAT_VOICE2TEXT_TIMEOUT_MS` 是单条语音的转写超时，超时会被中止且不影响对话。
+
 微信账号、Token、同步游标和发送上下文保存在 `data/ilink/`，该目录不会提交到 Git。
+
+## 语音消息
+
+微信语音是 SILK v3 格式，模型无法直接读，bot 分两种情况处理：
+
+1. **微信/iLink 自带转写文字**：消息里带 `voice_item.text` 时，按 `[语音] 文本` 交给 MiMoCode，不下载语音文件（这种情况最常见）。
+2. **没有转写文字**：把语音附件交给本地转写脚本（`WECHAT_VOICE2TEXT`，默认 `scripts/voice2text.sh`），结果以 `【语音转写】` 追加进消息正文；脚本不存在、超时或转写失败时只保留附件路径，不影响正常对话。
+
+转写管线（全离线，依赖装在 `/data/apps`，不占系统盘）：
+
+```text
+微信语音 .silk → silk-v3-decoder → 24kHz PCM → ffmpeg → 16kHz wav → whisper.cpp → 文本
+```
+
+| 组件 | 路径 | 环境变量 |
+| --- | --- | --- |
+| ffmpeg | `/data/apps/ffmpeg`（软链到 `/usr/local/bin/ffmpeg`） | — |
+| SILK 解码 | `/data/apps/silk-v3-decoder`（`silk2wav.sh`） | — |
+| whisper.cpp | `/data/apps/whisper.cpp` | — |
+| ASR 模型 | `/data/apps/whisper-models` | `WHISPER_MODEL` |
+| 语言 / 线程 / 提示词 | — | `WHISPER_LANG`、`WHISPER_THREADS`、`WHISPER_PROMPT` |
+
+实测（4 核 Cortex-A53）：`ggml-base-q5_1.bin`（默认）约 1.5~2 倍实时、中文准确度明显更好；`ggml-tiny-q5_1.bin` 约 1 倍实时但会听错（实测"九点"→"酒店"）。提示词默认用简体中文 + 领域词，可显著减少繁体输出。
+
+**限制**：目前只对"微信语音消息"自动转写。用户按**普通文件**发来的音频（mp3/m4a/wav/amr…）不会自动转写，MiMoCode 侧如需要可显式调用同一个脚本——`scripts/voice2text.sh` 除 `.silk` 外也支持其他常见音频格式（经 ffmpeg 转码）。
 
 ## 附件
 

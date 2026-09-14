@@ -16,6 +16,33 @@ const MIMO_SERVER_URL = process.env.MIMO_SERVER_URL ?? "http://127.0.0.1:4096"
 const DEFAULT_PROVIDER_ID = process.env.MIMO_PROVIDER_ID ?? "deepseek"
 const DEFAULT_MODEL_ID = process.env.MIMO_MODEL_ID ?? "deepseek-v4-flash"
 
+/**
+ * 单条 assistant message（或单个 step）的 token 用量。
+ * 服务端语义：total = input + output + reasoning + cacheRead + cacheWrite，
+ * 其中 input 是未命中缓存的提示词，cacheRead 是命中缓存的部分。
+ */
+export interface MimoTokenUsage {
+  total: number
+  input: number
+  output: number
+  reasoning: number
+  cacheRead: number
+  cacheWrite: number
+}
+
+/**
+ * 一次用户提问的累计用量。一次提问可能触发多条 assistant message
+ * （多步工具调用各算一条），逐条相加才是这次对话的真实开销。
+ */
+export interface MimoUsage {
+  input: number
+  output: number
+  reasoning: number
+  cacheRead: number
+  cacheWrite: number
+  steps: number
+}
+
 export interface MimoResult {
   success: boolean
   text: string
@@ -25,11 +52,10 @@ export interface MimoResult {
     providerID?: string
     modelID?: string
   }
-  tokens?: {
-    total: number
-    input: number
-    output: number
-  }
+  /** 最后一个 step 的用量，用于显示当前上下文占用。 */
+  tokens?: MimoTokenUsage
+  /** 本次提问的累计用量，用于计算缓存命中率与消费。 */
+  usage?: MimoUsage
 }
 
 export interface MimoProgress {
@@ -59,11 +85,7 @@ type ServerEvent = {
       sessionID?: string
       providerID?: string
       modelID?: string
-      tokens?: {
-        total?: number
-        input?: number
-        output?: number
-      }
+      tokens?: RawTokenUsage
     }
     part?: {
       id?: string
@@ -75,12 +97,19 @@ type ServerEvent = {
         start?: number
         end?: number
       }
-      tokens?: {
-        total?: number
-        input?: number
-        output?: number
-      }
+      tokens?: RawTokenUsage
     }
+  }
+}
+
+type RawTokenUsage = {
+  total?: number
+  input?: number
+  output?: number
+  reasoning?: number
+  cache?: {
+    read?: number
+    write?: number
   }
 }
 
@@ -235,17 +264,40 @@ async function compactSession(
   }
 }
 
-function tokenUsage(value?: {
-  total?: number
-  input?: number
-  output?: number
-}): MimoResult["tokens"] | undefined {
+/**
+ * 归一化服务端上报的 token 用量。user 消息和空 step 会上报全 0，
+ * 返回 undefined 以免把已有的有效值覆盖成 0。
+ */
+function tokenUsage(value?: RawTokenUsage): MimoTokenUsage | undefined {
   if (!value) return undefined
-  return {
-    total: value.total ?? 0,
-    input: value.input ?? 0,
-    output: value.output ?? 0,
+  const input = value.input ?? 0
+  const output = value.output ?? 0
+  const reasoning = value.reasoning ?? 0
+  const cacheRead = value.cache?.read ?? 0
+  const cacheWrite = value.cache?.write ?? 0
+  const total = value.total ?? input + output + reasoning + cacheRead + cacheWrite
+  if (total <= 0) return undefined
+  return { total, input, output, reasoning, cacheRead, cacheWrite }
+}
+
+function sumUsage(items: Iterable<MimoTokenUsage>): MimoUsage {
+  const total: MimoUsage = {
+    input: 0,
+    output: 0,
+    reasoning: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    steps: 0,
   }
+  for (const item of items) {
+    total.input += item.input
+    total.output += item.output
+    total.reasoning += item.reasoning
+    total.cacheRead += item.cacheRead
+    total.cacheWrite += item.cacheWrite
+    total.steps += 1
+  }
+  return total
 }
 
 export async function askMimo(
@@ -302,6 +354,8 @@ export async function askMimo(
   const reportedTextPartIds = new Set<string>()
   let model: MimoResult["model"]
   let tokens: MimoResult["tokens"]
+  // 每条 assistant message 只保留最新用量；一次提问可能产生多条 message，累加才是本次开销。
+  const usageByMessage = new Map<string, MimoTokenUsage>()
   let eventError: string | undefined
   let timedOut = false
   let aborted = false
@@ -379,12 +433,17 @@ export async function askMimo(
 
     if (event.type === "message.updated" && properties.info) {
       const info = properties.info
-      if (info.role === "assistant" && info.id) assistantMessageIds.add(info.id)
       if (info.providerID || info.modelID) {
         model = { providerID: info.providerID, modelID: info.modelID }
       }
-      const updatedTokens = tokenUsage(info.tokens)
-      if (updatedTokens) tokens = updatedTokens
+      if (info.role === "assistant" && info.id) {
+        assistantMessageIds.add(info.id)
+        const updatedTokens = tokenUsage(info.tokens)
+        if (updatedTokens) {
+          usageByMessage.set(info.id, updatedTokens)
+          tokens = updatedTokens
+        }
+      }
       return
     }
 
@@ -399,8 +458,11 @@ export async function askMimo(
       if (part.type === "step-finish") {
         // step-finish 前的文本就是最终回复，由 Bot 统一发送，避免重复。
         pendingTextPartIds.clear()
-        const updatedTokens = tokenUsage(part.tokens)
-        if (updatedTokens) tokens = updatedTokens
+        const stepTokens = tokenUsage(part.tokens)
+        if (stepTokens) {
+          usageByMessage.set(part.messageID, stepTokens)
+          tokens = stepTokens
+        }
         return
       }
       // 文本后又出现推理、工具或新步骤，说明它是阶段性输出，立即推送。
@@ -500,16 +562,18 @@ export async function askMimo(
     eventController.abort()
   }
 
+  const usage = usageByMessage.size > 0 ? sumUsage(usageByMessage.values()) : undefined
+
   if (aborted || signal?.aborted) {
-    return { success: false, text: "", error: "aborted", sessionId: activeSessionId, model, tokens }
+    return { success: false, text: "", error: "aborted", sessionId: activeSessionId, model, tokens, usage }
   }
   if (timedOut) {
-    return { success: false, text: "", error: "timeout", sessionId: activeSessionId, model, tokens }
+    return { success: false, text: "", error: "timeout", sessionId: activeSessionId, model, tokens, usage }
   }
 
   const text = currentText()
   if (text) {
-    return { success: true, text, sessionId: activeSessionId, model, tokens }
+    return { success: true, text, sessionId: activeSessionId, model, tokens, usage }
   }
   return {
     success: false,
@@ -518,5 +582,6 @@ export async function askMimo(
     sessionId: activeSessionId,
     model,
     tokens,
+    usage,
   }
 }

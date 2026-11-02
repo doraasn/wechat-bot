@@ -821,7 +821,7 @@ app.post("/admin/send", async (c) => {
   if (!known.includes(to)) return c.json({ error: "未知用户" }, 404)
   try {
     // 直接调用 ilink.sendText：失败会抛错，返回错误状态而非 ok
-    await ilink.sendText(to, text)
+    await ilink.sendText(to, text, undefined, "主动推送")
     return c.json({ ok: true, to })
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)

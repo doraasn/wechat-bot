@@ -5,6 +5,7 @@
  * cooooooooooode），仅保留本项目需要的账号恢复、消息轮询、文本发送和输入状态。
  */
 import crypto from "node:crypto"
+import { formatSendLog, type SendLogDetails } from "./send-log"
 import {
   existsSync,
   mkdirSync,
@@ -313,8 +314,10 @@ export class ILinkClient {
   private async sendMessageWithRetry(
     accountId: string,
     payload: Record<string, unknown>,
-    clientId: string,
+    details: SendLogDetails,
   ): Promise<void> {
+    const started = Date.now()
+    console.log(formatSendLog(details, "开始"))
     let lastError: unknown
     for (let attempt = 1; attempt <= SEND_RETRY_ATTEMPTS; attempt++) {
       try {
@@ -324,10 +327,11 @@ export class ILinkClient {
           payload,
         )
         assertSendMessageResponse(response)
+        console.log(formatSendLog(details, "成功", attempt, Date.now() - started))
         return
       } catch (error) {
         lastError = error
-        console.log(`[send] attempt=${attempt}/${SEND_RETRY_ATTEMPTS} client=${clientId} failed: ${error}`)
+        console.log(formatSendLog(details, attempt < SEND_RETRY_ATTEMPTS ? "重试" : "失败", attempt, Date.now() - started, error))
         if (attempt < SEND_RETRY_ATTEMPTS) await Bun.sleep(attempt * RETRY_DELAY_MS)
       }
     }
@@ -503,10 +507,20 @@ export class ILinkClient {
     console.log(`[ilink] stopped account=${accountId}`)
   }
 
-  async sendText(to: string, markdown: string, deliveryId: string = crypto.randomUUID()): Promise<void> {
+  async sendText(to: string, markdown: string, deliveryId: string = crypto.randomUUID(), source = "机器人回复"): Promise<void> {
     const context = this.contexts.get(to)
-    if (!context?.contextToken) throw new Error(`用户 ${to} 缺少 context_token`)
-    const accountId = this.contextAccountId(to, context)
+    if (!context?.contextToken) {
+      const error = new Error(`用户 ${to} 缺少 context_token`)
+      console.log(formatSendLog({ to, account: "", client: deliveryId, type: "文本", text: markdown, source }, "失败", 0, 0, error))
+      throw error
+    }
+    let accountId: string
+    try {
+      accountId = this.contextAccountId(to, context)
+    } catch (error) {
+      console.log(formatSendLog({ to, account: context.accountId || "", client: deliveryId, type: "文本", text: markdown, source }, "失败", 0, 0, error))
+      throw error
+    }
     const chunks = splitMarkdown(markdown)
     for (let index = 0; index < chunks.length; index++) {
       const chunk = chunks[index] ?? ""
@@ -524,7 +538,7 @@ export class ILinkClient {
           }],
           context_token: context.contextToken,
         },
-      }, clientId)
+      }, { to, account: accountId, client: clientId, type: "文本", text: chunk, source, part: `${index + 1}/${chunks.length}` })
     }
   }
 
@@ -558,7 +572,7 @@ export class ILinkClient {
         item_list: [item],
         context_token: context.contextToken,
       },
-    }, clientId)
+    }, { to, account: accountId, client: clientId, type: ({ 2: "图片", 4: "文件", 5: "视频" } as Record<number, string>)[item.type ?? 0] || "媒体", text: path.basename(filePath), source: "机器人附件" })
   }
 
   async sendTyping(to: string, typing: boolean): Promise<void> {
